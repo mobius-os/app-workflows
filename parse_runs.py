@@ -49,6 +49,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Protocol
 
@@ -111,7 +112,7 @@ MAX_LIFECYCLE_CACHE_EVENTS_PER_CHAT = 2_000
 MAX_TIMELINE_EVENTS_PER_CHAT = MAX_TIMELINE_AGENTS * 3 + 40
 
 SCHEMA_NOTES = """\
-index.json  {schema, updated_at, needs_attention:[...], entries:[...], history:{chats_omitted}}
+index.json  {schema, updated_at, needs_attention:[{chat_id,title,outcome,kind,reason,next_action,agent_id}], entries:[...], history:{chats_omitted}}
 chats/<id> {schema, chat_id, provider, title, outcome, prompt_full, ts, turns:[...], timeline:{...,retention}}
 helpers/<id> {schema, agent_id, chat_id, brief_full}
 """
@@ -2435,7 +2436,9 @@ def _block_evidence(helper: dict, provider: str) -> dict:
   # Older chat caches can call a tool block "finished" even when its payload is
   # plainly the helper's next intended action. Keep that cached bookkeeping
   # from overriding a stopped trace during evidence reconciliation.
-  if state == "done" and _looks_progress_report(report):
+  procedural_report = _looks_progress_report(report)
+  progress_demoted = state == "done" and procedural_report
+  if progress_demoted:
     state = "stopped"
   return {
     "agent_id": str(helper["agent_id"]),
@@ -2454,7 +2457,14 @@ def _block_evidence(helper: dict, provider: str) -> dict:
                              else "unknown"),
     "ended_at": None, "ended_time_quality": "unknown",
     "last_activity_at": _coerce_iso(helper.get("_spawned_at")),
-    "lifecycle_state": ("unknown" if state == "running" else state),
+    # A cached "finished" block containing only procedural next steps proves
+    # neither completion nor an explicit stop. Keep its display state
+    # conservative while avoiding a false owner-attention alarm.
+    "lifecycle_state": (
+      "unknown"
+      if state == "running" or (state == "stopped" and procedural_report)
+      else state
+    ),
   }
 
 
@@ -2800,17 +2810,15 @@ def _build_v3_turn(raw: dict, helpers: dict[str, dict],
             or _request_noun(request_hint) or area)
   neutral = f"{verb} {area}"
   states = [sub["state"] for sub in subs]
+  lifecycle_states = [sub.get("lifecycle_state", "unknown") for sub in subs]
+  delivery = _delivery_sentence(original)
 
   flag = None
-  if "failed" in states:
-    status, result = "attention", "couldn't complete"
-    flag = "A helper reported a failure, so this turn needs a look."
-  elif "running" in states:
-    status, result = "running", "in progress"
-  elif "stopped" in states:
-    status, result = "attention", "stopped"
-    flag = "The recorded work stopped without a completion result."
-  elif verification == "failed":
+  # A helper failure is evidence about that helper, not automatically an owner
+  # decision. When the main agent subsequently delivered the requested result,
+  # keep the failure visible in the timeline without turning the whole chat
+  # amber. Verification failure and explicit uncertainty still win.
+  if verification == "failed":
     status, result = "attention", "not confirmed"
     flag = f"The recorded check for {area} failed, so the claimed result was not confirmed."
   elif _turn_stopped(original):
@@ -2819,11 +2827,18 @@ def _build_v3_turn(raw: dict, helpers: dict[str, dict],
   elif _hedges_result(original):
     status, result = "attention", "not confirmed"
     flag = f"The recorded report for {area} hedged the result, so it was not confirmed."
+  elif "failed" in states and not delivery:
+    status, result = "attention", "couldn't complete"
+    flag = "A helper reported a failure, so this turn needs your input."
+  elif "running" in states:
+    status, result = "running", "in progress"
+  elif "stopped" in lifecycle_states and not delivery:
+    status, result = "attention", "stopped"
+    flag = "The recorded work stopped without a completion result."
   else:
     status = "done"
     result = "found the cause" if not changed and _found_cause(original) else "done"
 
-  delivery = _delivery_sentence(original)
   # A delivery claim is only a hero line when the evidence supports `done`.
   # Attention/running turns stay neutral and put the caveat in `flag`.
   outcome = delivery if status == "done" and delivery else neutral
@@ -3179,9 +3194,52 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
                     platform_events: list[dict], platform_runs: list[dict],
                     turns: list[dict], agents_omitted: int = 0,
                     events_omitted: int = 0) -> dict:
+  # Outcome-only historical records have no assignment to distinguish them
+  # from their siblings. They add repeated "No brief was recorded" lanes but
+  # cannot answer the owner's primary question: what was this helper doing?
+  # Keep unresolved records for honesty; omit only resolved, taskless rows and
+  # report the omission explicitly in retention metadata.
+  eligible_helpers = [
+    helper for helper in merged.values()
+    if ((helper.get("ask") and helper.get("ask") != "No brief was recorded")
+        or helper.get("brief_full")
+        or helper.get("lifecycle_state") in ("failed", "stopped", "running"))
+  ]
+  # Exact repeated assignments are attempts at the same task at this skim
+  # layer. Draw one lane at the latest recorded attempt and carry the attempt
+  # count/state mix with it. This removes visual duplication without hiding a
+  # later failure or stop behind an earlier successful attempt.
+  grouped_helpers: dict[tuple[str, str], list[tuple[tuple, int, dict]]] = {}
+  for insertion, helper in enumerate(eligible_helpers):
+    task = re.sub(r"\s+", " ", str(helper.get("ask") or "").strip()).casefold()
+    key = ((str(helper.get("parent_agent_id") or "main")), task)
+    if not task or task == "no brief was recorded":
+      key = (str(helper.get("agent_id")), task)
+    activity = max((
+      _iso_to_epoch(helper.get("last_activity_at")),
+      _iso_to_epoch(helper.get("ended_at")),
+      _iso_to_epoch(helper.get("started_at")),
+    ), key=lambda value: value if value is not None else float("-inf"))
+    score = (
+      activity if activity is not None else float("-inf"),
+      insertion,
+    )
+    grouped_helpers.setdefault(key, []).append((score, insertion, helper))
+  display_helpers = []
+  for attempts in grouped_helpers.values():
+    _, insertion, helper = max(attempts, key=lambda row: row[0])
+    public_helper = dict(helper)
+    public_helper["_display_insertion"] = insertion
+    public_helper["_attempt_count"] = len(attempts)
+    public_helper["_attempt_states"] = dict(Counter(
+      str(row[2].get("lifecycle_state") or "unknown") for row in attempts))
+    display_helpers.append(public_helper)
+  display_helpers.sort(key=lambda helper: helper["_display_insertion"])
+  detail_omitted = max(0, len(merged) - len(display_helpers))
+  display_ids = {str(helper["agent_id"]) for helper in display_helpers}
   agents: list[dict] = []
   seen: set[str] = set()
-  for helper in merged.values():
+  for helper in display_helpers:
     aid = str(helper["agent_id"])
     if aid in seen:
       continue
@@ -3195,6 +3253,8 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
       "state": helper.get("lifecycle_state") or "unknown",
       "prompt_available": bool(helper.get("brief_full")),
       "outcome_summary": helper.get("result") or "",
+      "attempt_count": helper["_attempt_count"],
+      "attempt_states": helper["_attempt_states"],
       "started_at": helper.get("started_at"), "ended_at": helper.get("ended_at"),
       "start_time_quality": helper.get("started_time_quality") or "unknown",
       "end_time_quality": helper.get("ended_time_quality") or "unknown",
@@ -3206,8 +3266,12 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
     agent["parent_agent_id"] = parent_map[agent["agent_id"]]
 
   public_events: list[dict] = []
-  platform_subjects = {event["agent_id"] for event in platform_events}
-  for event in platform_events:
+  visible_platform_events = [
+    event for event in platform_events
+    if str(event.get("agent_id") or "") in display_ids
+  ]
+  platform_subjects = {event["agent_id"] for event in visible_platform_events}
+  for event in visible_platform_events:
     actor = event.get("parent_agent_id")
     public_events.append(_timeline_event(
       event["event_id"], event["type"], event["agent_id"], actor,
@@ -3216,7 +3280,7 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
       source_order=event.get("id") or 0,
       source_event_id=event.get("source_event_id"),
       chat_run_id=event.get("chat_run_id")))
-  for helper in merged.values():
+  for helper in display_helpers:
     aid = str(helper["agent_id"])
     if aid in platform_subjects:
       continue
@@ -3263,8 +3327,11 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
     "agents": agents,
     "events": _ordered_timeline_events(public_events, parent_map),
     "retention": {
-      "agents_omitted": max(0, int(agents_omitted)),
-      "events_omitted": max(0, int(events_omitted) + compacted_events),
+      "agents_omitted": max(0, int(agents_omitted) + detail_omitted),
+      "events_omitted": max(
+        0, int(events_omitted)
+        + len(platform_events) - len(visible_platform_events)
+        + compacted_events),
     },
   }
 
@@ -3476,6 +3543,83 @@ def _document_status(doc: dict) -> tuple[str, str]:
   return status, result
 
 
+def _attention_detail(doc: dict, status: str, result: str) -> Optional[dict]:
+  """Turn an amber status into an owner-readable reason and next step.
+
+  Reflection's report contract uses Trigger / Why / Next. Workflows keeps that
+  same information density in one compact record: `reason` explains the
+  evidence, `next_action` says what the owner can do, and `agent_id` provides a
+  direct drill-in target when one helper is responsible.
+  """
+  if status != "attention":
+    return None
+  turns = doc.get("turns") or []
+  runs = (doc.get("timeline") or {}).get("main_runs") or []
+  latest_run = max(runs, key=lambda run: (
+    _iso_to_epoch(run.get("started_at")) or float("-inf"),
+    str(run.get("id") or ""),
+  ), default={})
+  root_status = str(latest_run.get("status") or "").lower()
+  root_attention = root_status in {
+    "failed", "stopped", "interrupted", "cancelled", "canceled",
+    "parked", "parked_notified",
+  }
+  # A root lifecycle failure should use its own neutral explanation. An older
+  # turn can have the same result label while referring to unrelated work.
+  turn = {} if root_attention else next((
+    row for row in reversed(turns)
+    if row.get("status") == "attention" and row.get("result") == result
+  ), {})
+  default_reasons = {
+    "couldn't complete": "A helper failed before returning a usable result.",
+    "stopped": "The work stopped before a completion result was recorded.",
+    "paused": "The workflow is paused and may be waiting for your input.",
+    "not confirmed": "The result was recorded, but its verification did not complete.",
+  }
+  root_reasons = {
+    "failed": "The main agent could not complete this workflow.",
+    "stopped": "The main work stopped before a completion was recorded.",
+    "interrupted": "The main work stopped before a completion was recorded.",
+    "cancelled": "The main work stopped before a completion was recorded.",
+    "canceled": "The main work stopped before a completion was recorded.",
+    "parked": "The workflow is paused and may be waiting for your input.",
+    "parked_notified": "The workflow is paused and may be waiting for your input.",
+  }
+  kind = {
+    "couldn't complete": "failed",
+    "stopped": "stopped",
+    "paused": "paused",
+    "not confirmed": "unconfirmed",
+  }.get(result, "attention")
+  next_actions = {
+    "failed": "Review what failed, then retry the work in the original chat.",
+    "stopped": "Review what finished, then continue the work in the original chat if needed.",
+    "paused": "Open the original chat to answer or resume the workflow.",
+    "unconfirmed": "Review the evidence, then rerun the check in the original chat if needed.",
+    "attention": "Review the recorded work, then continue in the original chat if needed.",
+  }
+  agents = (doc.get("timeline") or {}).get("agents") or []
+  wanted_states = {
+    "failed": ("failed",),
+    "stopped": ("stopped", "unknown"),
+  }.get(kind, ())
+  targets = [agent for agent in agents if agent.get("state") in wanted_states]
+  target = max(targets, key=lambda agent: (
+    _iso_to_epoch(agent.get("last_activity_at"))
+    or _iso_to_epoch(agent.get("ended_at"))
+    or _iso_to_epoch(agent.get("started_at"))
+    or float("-inf"),
+    str(agent.get("agent_id") or ""),
+  ), default=None)
+  return {
+    "kind": kind,
+    "reason": clip_line(str(turn.get("flag") or root_reasons.get(root_status)
+      or default_reasons.get(result, "This workflow has an unresolved result.")), 240),
+    "next_action": next_actions[kind],
+    "agent_id": target.get("agent_id") if target else None,
+  }
+
+
 def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: float,
                  chats_omitted: int = 0) -> dict:
   entries: list[dict] = []
@@ -3490,15 +3634,17 @@ def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: floa
       "ts": doc.get("ts"),
     }
     entries.append(row)
-    if status != "done":
+    attention = _attention_detail(doc, status, result)
+    if attention:
       needs_attention.append({
-        "chat_id": chat_id, "outcome": doc["outcome"],
+        "chat_id": chat_id, "title": doc["title"], "outcome": doc["outcome"],
+        **attention,
       })
   entries.sort(key=lambda row: row.get("ts") or "", reverse=True)
-  attention_ids = {row["chat_id"] for row in needs_attention}
+  attention_by_id = {row["chat_id"]: row for row in needs_attention}
   needs_attention = [
-    {"chat_id": row["chat_id"], "outcome": row["outcome"]}
-    for row in entries if row["chat_id"] in attention_ids
+    attention_by_id[row["chat_id"]]
+    for row in entries if row["chat_id"] in attention_by_id
   ]
   return {"schema": SCHEMA_VERSION, "updated_at": _epoch_to_iso(now),
           "needs_attention": needs_attention, "entries": entries,
@@ -4146,7 +4292,8 @@ def selftest() -> int:
                            "result", "status", "tasks", "ts"},
               f"index entry keys: {set(row)}")
     for row in index["needs_attention"]:
-      _assert(set(row) == {"chat_id", "outcome"},
+      _assert(set(row) == {"chat_id", "title", "outcome", "kind", "reason",
+                           "next_action", "agent_id"},
               f"attention entry keys: {set(row)}")
 
     doc_a = chats["chatA"]
@@ -4298,6 +4445,64 @@ def selftest() -> int:
     _assert(failed_index["entries"][0]["status"] == "attention"
             and failed_index["needs_attention"],
             "latest durable root failure drives the journal and attention strip")
+    failed_attention = failed_index["needs_attention"][0]
+    _assert(failed_attention["kind"] == "failed"
+            and "main agent" in failed_attention["reason"].lower()
+            and "original chat" in failed_attention["next_action"],
+            f"attention has an owner-readable reason and next step: {failed_attention}")
+
+    delivered_after_failure = _build_v3_turn({
+      "_agent_ids": ["recoverable"], "_tools": [],
+      "_facts": {"area_evidence": [], "verb": "Updated",
+                 "changed": True, "verification": "none"},
+      "_original": "Updated the chat UI and verified the final interaction.",
+      "_first_request": "",
+    }, {"recoverable": {
+      "agent_id": "recoverable", "kind": "codex", "name": "Codex",
+      "ask": "Investigate one failed path", "state": "failed", "depth": 1,
+      "brief_full": "Investigate one failed path", "_tools": [],
+    }}, "the chat UI")
+    _assert(delivered_after_failure["status"] == "done",
+            f"a recovered helper failure stays visible without alarming the owner: {delivered_after_failure}")
+
+    running_index = _build_index({"chatA": {
+      **platform_doc,
+      "timeline": {**platform_doc["timeline"], "main_runs": [
+        *platform_doc["timeline"]["main_runs"],
+        {"id": "run-latest-running", "status": "running",
+         "started_at": "2026-07-17T10:20:00Z", "ended_at": None},
+      ]},
+    }}, {}, now)
+    _assert(running_index["entries"][0]["status"] == "running"
+            and not running_index["needs_attention"],
+            "active work is visible but does not masquerade as owner attention")
+
+    duplicate_timeline = _build_timeline(
+      "chat-duplicates", "codex", {
+        "done-a": {
+          "agent_id": "done-a", "parent_agent_id": "main",
+          "ask": "Review the parser", "lifecycle_state": "done",
+          "result": "Parser reviewed.", "ended_at": "2026-07-17T10:30:00Z",
+        },
+        "done-b": {
+          "agent_id": "done-b", "parent_agent_id": "main",
+          "ask": "Review the parser", "lifecycle_state": "done",
+          "result": "Parser reviewed again.", "ended_at": "2026-07-17T10:31:00Z",
+        },
+        "failed-retry": {
+          "agent_id": "failed-retry", "parent_agent_id": "main",
+          "ask": "Review the parser", "lifecycle_state": "failed",
+          "result": "The retry failed.", "ended_at": "2026-07-17T10:32:00Z",
+        },
+      }, [], [], [])
+    duplicate_agents = duplicate_timeline["agents"]
+    _assert(len(duplicate_agents) == 1
+            and duplicate_agents[0]["agent_id"] == "failed-retry"
+            and duplicate_agents[0]["state"] == "failed"
+            and duplicate_agents[0]["attempt_count"] == 3
+            and duplicate_agents[0]["attempt_states"] == {"done": 2, "failed": 1}
+            and duplicate_timeline["retention"]["agents_omitted"] == 2,
+            f"resolved duplicate work is summarized without hiding an unresolved retry: {duplicate_agents}")
 
     # A lifecycle-only chat must render without any trace/chat-block evidence.
     life_only_raw = {"id": 20, "event_key": "only-start", "chat_id": "chatOnly",

@@ -1,6 +1,6 @@
 # Workflows
 
-Workflows is an outcome journal for the background work in your Möbius chats. The journal leads with completed outcomes and groups activity by day. A “worth a look” strip gathers unfinished, failed, or unconfirmed work.
+Workflows is an outcome journal for the background work in your Möbius chats. The journal leads with completed outcomes and groups activity by day. “Needs your input” gathers only unresolved work that calls for an owner decision, and pairs every item with a reason and a concrete next step.
 
 Open an entry to see a chronological execution timeline. Time flows downward on a fixed main-agent lane; concurrent helpers occupy temporary side lanes, and nested helpers connect to the helper that launched them. Each lane shows the task and lifecycle at a glance, while the full prompt stays one click away.
 
@@ -14,9 +14,9 @@ The journal records three layers of background activity:
 
 ## Evidence and status
 
-Workflows derives status from recorded artifacts. It never asks a model to judge whether its own work succeeded. Explicit failures override bookkeeping. A background-launch acknowledgement never counts as a completion report. A fresh unresolved launch appears as running. If it ages out without a result, it appears as stopped. Later terminal evidence can still resolve it.
+Workflows derives status from recorded artifacts. It never asks a model to judge whether its own work succeeded. A background-launch acknowledgement never counts as a completion report, and active work stays separate from owner attention. A failed helper remains visible in the timeline without alarming the owner when the main agent subsequently delivered and verified the requested result. Explicit root failures, explicit stops, and unconfirmed results remain actionable. Later terminal evidence can still resolve them.
 
-The parser scrubs secret-shaped values from free text and caps it before publication. The interface omits missing fields instead of inventing values. If the storage safety cap removes an old helper page, the chat history stays visible without a broken drill-in.
+The parser scrubs secret-shaped values from free text and caps it before publication. The interface omits missing fields instead of inventing values. Exact repeated assignments become one task lane with an attempt count and state mix; resolved records without a usable task summary are summarized at the skim layer. Retention metadata reports both, while distinct work and unresolved attempt states remain visible. If the storage safety cap removes an old helper page, the chat history stays visible without a broken drill-in.
 
 ## How Workflows builds the journal
 

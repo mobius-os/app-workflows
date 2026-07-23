@@ -18,7 +18,7 @@ export function providerLabel(provider) {
 
 // ---------------------------------------------------------------------------
 // Ambient status — the three journal/turn states and their dot styling.
-// `done` is the quiet default; `attention` is the amber "needs a look"; `run`
+// `done` is the quiet default; `attention` is the amber "needs input"; `run`
 // is in-progress. Anything unknown stays neutral rather than inventing success.
 // ---------------------------------------------------------------------------
 
@@ -165,6 +165,8 @@ function v3Timeline(turns, mainAgentId) {
         state: canonicalAgentState(sub.state),
         prompt_available: sub.prompt_available !== false,
         outcome_summary: sub.outcome || '',
+        attempt_count: 1,
+        attempt_states: { [canonicalAgentState(sub.state)]: 1 },
         last_activity_at: null,
         depth: Math.max(1, Number(sub.depth) || 1),
         ancestry_quality: 'unknown',
@@ -207,6 +209,12 @@ export function normalizeTimeline(timeline, turns = []) {
     state: canonicalAgentState(raw.state),
     prompt_available: raw.prompt_available !== false,
     outcome_summary: raw.outcome_summary || raw.outcome || '',
+    attempt_count: Math.max(1, Number(raw.attempt_count) || 1),
+    attempt_states: raw.attempt_states && typeof raw.attempt_states === 'object'
+      ? Object.fromEntries(Object.entries(raw.attempt_states)
+        .filter(([, count]) => Number.isFinite(Number(count)) && Number(count) > 0)
+        .map(([state, count]) => [canonicalAgentState(state), Number(count)]))
+      : {},
     last_activity_at: raw.last_activity_at || null,
     depth: Math.max(1, Number(raw.depth) || 1),
     ancestry_quality: raw.ancestry_quality || (raw.parent_agent_id ? 'exact' : 'unknown'),

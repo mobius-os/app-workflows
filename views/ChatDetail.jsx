@@ -169,7 +169,13 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
                 )}
               </div>
             </section>
-            <Timeline timeline={timeline} turns={turns} store={store} storage={storage} />
+            <Timeline
+              timeline={timeline}
+              turns={turns}
+              store={store}
+              storage={storage}
+              onOpenChat={() => onOpenChat(chatId)}
+            />
           </div>
         )}
       </main>

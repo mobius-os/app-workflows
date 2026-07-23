@@ -1,5 +1,5 @@
 // Home — the outcome JOURNAL. Reads like a diary of what the assistant got
-// done: an app header, a "Needs you" strip for anything worth a look, then the
+// done: an app header, a "Needs your input" panel for actionable work, then the
 // entries grouped by day. Each entry is one tappable row — root task, ambient
 // status, latest outcome, and helper count — that opens the layered timeline.
 // Missing fields are omitted, never faked.
@@ -7,27 +7,70 @@
 import React, { useState } from 'react'
 import { statusDot, groupEntriesByDay } from '../domain.js'
 
-// The strip at the top of the journal. Amber and tappable while something is
-// unverified/failed/running and absent when everything is healthy. Tapping
-// filters the journal rather than unexpectedly opening only the first item.
-function NeedsStrip({ items, active, onToggle }) {
+// The attention summary follows Reflection's skim-first contract: one useful
+// reason is always visible, then the complete Reason / Next list expands in
+// place. Each row opens the exact workflow instead of silently filtering the
+// journal and leaving the owner to hunt for the problem.
+function NeedsPanel({ items, open, onToggle, onOpen }) {
   const list = Array.isArray(items) ? items : []
   if (list.length === 0) return null
   const first = list[0]
   const n = list.length
+  const kindLabel = (kind) => ({
+    failed: 'Failed',
+    stopped: 'Stopped',
+    paused: 'Paused',
+    unconfirmed: 'Unconfirmed',
+  }[kind] || 'Needs review')
   return (
-    <button type="button" className="wf-needs" onClick={onToggle} aria-pressed={active}>
-      <span className="wf-needs-ic" aria-hidden="true">!</span>
-      <span className="wf-needs-tx">
-        <span className="wf-needs-head">
-          {active ? `Showing ${n} item${n === 1 ? '' : 's'} that need a look` : `${n} thing${n === 1 ? '' : 's'} worth a look`}
+    <section className={`wf-needs-wrap${open ? ' is-open' : ''}`} aria-labelledby="wf-needs-title">
+      <button
+        type="button"
+        className="wf-needs"
+        onClick={onToggle}
+        aria-expanded={open}
+        aria-controls="wf-needs-list"
+      >
+        <span className="wf-needs-ic" aria-hidden="true">!</span>
+        <span className="wf-needs-tx">
+          <span className="wf-needs-head" id="wf-needs-title">
+            {n} workflow{n === 1 ? '' : 's'} need{n === 1 ? 's' : ''} your input
+          </span>
+          <span className="wf-needs-sub">
+            {(first && first.reason) || 'Open to see what happened and what to do next'}
+          </span>
         </span>
-        <span className="wf-needs-sub">
-          {active ? 'Show all workflows' : (first && first.outcome) || 'Filter to unfinished work'}
-        </span>
-      </span>
-      <span className="wf-needs-go" aria-hidden="true">{active ? '×' : '›'}</span>
-    </button>
+        <span className="wf-needs-go" aria-hidden="true">{open ? '⌃' : '⌄'}</span>
+      </button>
+      {open && (
+        <div className="wf-needs-list" id="wf-needs-list">
+          {list.map((item) => (
+            <button
+              type="button"
+              className="wf-needs-item"
+              key={item.chat_id}
+              onClick={() => onOpen(item)}
+            >
+              <span className={`wf-needs-kind is-${item.kind || 'attention'}`}>
+                {kindLabel(item.kind)}
+              </span>
+              <span className="wf-needs-item-copy">
+                <span className="wf-needs-item-title">
+                  {item.title || item.outcome || 'Workflow'}
+                </span>
+                <span className="wf-needs-reason">
+                  {item.reason || 'This workflow has an unresolved result.'}
+                </span>
+                <span className="wf-needs-next">
+                  <strong>Next:</strong> {item.next_action || 'Open the workflow to review what happened.'}
+                </span>
+              </span>
+              <span className="wf-needs-item-go" aria-hidden="true">›</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -37,7 +80,7 @@ function EntryCard({ entry, onOpen }) {
   const stateLabel = dot === 'done'
     ? 'Done'
     : dot === 'attn'
-      ? 'Needs a look'
+      ? 'Needs input'
       : dot === 'run'
         ? 'Running'
         : 'Status unavailable'
@@ -70,13 +113,8 @@ export function Home({
 }) {
   const entries = (idx && Array.isArray(idx.entries)) ? idx.entries : []
   const needs = (idx && Array.isArray(idx.needs_attention)) ? idx.needs_attention : []
-  const [attentionOnly, setAttentionOnly] = useState(false)
-  const showAttention = attentionOnly && needs.length > 0
-  const attentionIds = new Set(needs.map((item) => item.chat_id))
-  const visibleEntries = showAttention
-    ? entries.filter((entry) => attentionIds.has(entry.chat_id))
-    : entries
-  const groups = groupEntriesByDay(visibleEntries)
+  const [attentionOpen, setAttentionOpen] = useState(false)
+  const groups = groupEntriesByDay(entries)
   const isEmpty = loaded && entries.length === 0
   const omittedChats = Math.max(0, Number(idx && idx.history && idx.history.chats_omitted) || 0)
 
@@ -130,7 +168,7 @@ export function Home({
             <p className="wf-empty-text">
               When your assistant works on something in the background, it lands
               here as a plain-language journal — what it got done, and anything
-              worth a look.
+              that needs your input.
             </p>
             <div className="wf-empty-actions">
               <button type="button" className="wf-btn wf-btn-primary" onClick={onRefresh} disabled={refreshing}>
@@ -140,10 +178,11 @@ export function Home({
           </div>
         ) : (
           <div className="wf-content">
-            <NeedsStrip
+            <NeedsPanel
               items={needs}
-              active={showAttention}
-              onToggle={() => setAttentionOnly((value) => !value)}
+              open={attentionOpen}
+              onToggle={() => setAttentionOpen((value) => !value)}
+              onOpen={onOpenDetail}
             />
             {omittedChats > 0 && (
               <p className="wf-history-note">
