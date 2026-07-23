@@ -3680,7 +3680,20 @@ def _attention_detail(doc: dict, status: str, result: str) -> Optional[dict]:
     "failed": ("failed",),
     "stopped": ("stopped", "unknown"),
   }.get(kind, ())
-  targets = [agent for agent in agents if agent.get("state") in wanted_states]
+  latest_run_id = str(latest_run.get("id") or "")
+  # A root-run failure belongs to that run, not to any older failed helper in
+  # the same chat. Only offer a direct helper drill-in when lifecycle evidence
+  # ties it to the exact latest run; otherwise the original-chat action is the
+  # honest target.
+  if root_attention:
+    targets = [
+      agent for agent in agents
+      if (latest_run_id
+          and str(agent.get("chat_run_id") or "") == latest_run_id
+          and agent.get("state") in wanted_states)
+    ]
+  else:
+    targets = [agent for agent in agents if agent.get("state") in wanted_states]
   target = max(targets, key=lambda agent: (
     _iso_to_epoch(agent.get("last_activity_at"))
     or _iso_to_epoch(agent.get("ended_at"))
@@ -4525,8 +4538,30 @@ def selftest() -> int:
     failed_attention = failed_index["needs_attention"][0]
     _assert(failed_attention["kind"] == "failed"
             and "main agent" in failed_attention["reason"].lower()
-            and "original chat" in failed_attention["next_action"],
+            and "original chat" in failed_attention["next_action"]
+            and failed_attention["agent_id"] is None,
             f"attention has an owner-readable reason and next step: {failed_attention}")
+
+    same_run_failure_index = _build_index({"chatA": {
+      **platform_doc,
+      "timeline": {
+        **platform_doc["timeline"],
+        "agents": [
+          {**agent, "chat_run_id": "run-current-failed", "state": "failed"}
+          if agent["agent_id"] == "opaque-a" else agent
+          for agent in platform_doc["timeline"]["agents"]
+        ],
+        "main_runs": [
+          *platform_doc["timeline"]["main_runs"],
+          {"id": "run-current-failed", "status": "failed",
+           "started_at": "2026-07-17T10:10:00Z",
+           "ended_at": "2026-07-17T10:10:01Z"},
+        ],
+      },
+    }}, {}, now)
+    _assert(
+      same_run_failure_index["needs_attention"][0]["agent_id"] == "opaque-a",
+      "root attention links a helper only when it belongs to the exact failed run")
 
     delivered_after_failure = _build_v3_turn({
       "_agent_ids": ["recoverable"], "_tools": [],

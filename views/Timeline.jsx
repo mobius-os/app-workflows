@@ -144,7 +144,17 @@ function attentionIssue(timeline, turns, agents) {
   const targetStates = kind === 'failed'
     ? ['failed']
     : kind === 'stopped' ? ['stopped', 'unknown'] : []
-  const agent = agents.filter((candidate) => targetStates.includes(candidate.state))
+  const rootAttention = [
+    'failed', 'stopped', 'interrupted', 'cancelled', 'canceled',
+    'parked', 'parked_notified',
+  ].includes(runStatus)
+  const latestRunId = String(latestRun && latestRun.id || '')
+  const targetAgents = rootAttention
+    ? agents.filter((candidate) => (
+      latestRunId && String(candidate.chat_run_id || '') === latestRunId
+    ))
+    : agents
+  const agent = targetAgents.filter((candidate) => targetStates.includes(candidate.state))
     .sort((a, b) => {
       const at = Date.parse(a.last_activity_at || '')
       const bt = Date.parse(b.last_activity_at || '')
