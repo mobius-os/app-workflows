@@ -35,38 +35,76 @@ function xForLane(lane) {
 }
 
 function launchCohorts(model) {
-  const result = new Map()
+  const byEvent = new Map()
+  const byAgent = new Map()
+  const groups = []
   let group = []
   const flush = () => {
     if (group.length > 1) {
-      group.forEach((row, index) => result.set(row.event_id, {
-        position: index + 1,
-        total: group.length,
-      }))
+      const cohort = {
+        id: `cohort:${group[0].event_id}`,
+        firstEventId: group[0].event_id,
+        rows: [...group],
+        agentIds: group.map((row) => row.subject_agent_id),
+      }
+      groups.push(cohort)
+      group.forEach((row, index) => {
+        const member = { ...cohort, position: index + 1, total: group.length }
+        byEvent.set(row.event_id, member)
+        byAgent.set(row.subject_agent_id, member)
+      })
     }
     group = []
   }
   for (const row of model.rows) {
     const span = model.spansByAgent.get(row.subject_agent_id)
-    const isLaunch = row.type === 'agent_spawned'
-      || (row.type === 'agent_started' && span && span.startEvent === row)
-    if (!isLaunch) continue
+    // Cohorts represent one batch launch, not merely tasks that happened to
+    // start close together. A checkpoint/terminal event closes the batch, and
+    // retries for an existing logical helper stay inside that helper's detail.
+    const isLaunch = span && span.startEvent === row
+    if (!isLaunch) {
+      flush()
+      continue
+    }
     const at = Date.parse(row.at || '')
     const previous = group[group.length - 1]
-    const previousAt = previous ? Date.parse(previous.at || '') : NaN
-    const sameLauncher = previous && previous.actor_agent_id === row.actor_agent_id
-    if (previous && (!Number.isFinite(at) || !Number.isFinite(previousAt)
-        || !sameLauncher || at - previousAt > 20_000)) {
+    const firstAt = group.length ? Date.parse(group[0].at || '') : NaN
+    // Only assert a shared launch when the recorder gave us the launcher id,
+    // and keep the whole cohort inside one 20-second window. Comparing with
+    // only the previous launch could otherwise chain a long sequence together.
+    const sameLauncher = previous && previous.actor_agent_id
+      && previous.actor_agent_id === row.actor_agent_id
+    if (previous && (!Number.isFinite(at) || !Number.isFinite(firstAt)
+        || !sameLauncher || at - firstAt > 20_000)) {
       flush()
     }
     group.push(row)
   }
   flush()
-  return result
+  return { byEvent, byAgent, groups }
 }
 
 function isGenericAgentName(name) {
   return ['helper', 'explorer', 'codex', 'builder'].includes(String(name || '').trim().toLowerCase())
+}
+
+function stateCounts(agents) {
+  const counts = { done: 0, running: 0, failed: 0, stopped: 0, unknown: 0 }
+  for (const agent of agents) {
+    const state = counts[agent.state] == null ? 'unknown' : agent.state
+    counts[state] += 1
+  }
+  return counts
+}
+
+function compactStateSummary(counts) {
+  return [
+    counts.done && `${counts.done} done`,
+    counts.running && `${counts.running} active`,
+    counts.failed && `${counts.failed} failed`,
+    counts.stopped && `${counts.stopped} stopped`,
+    counts.unknown && `${counts.unknown} unknown`,
+  ].filter(Boolean).join(' · ')
 }
 
 function attentionIssue(timeline, turns, agents) {
@@ -103,13 +141,6 @@ function attentionIssue(timeline, turns, agents) {
     paused: 'paused',
     'not confirmed': 'unconfirmed',
   }[result] || 'attention'
-  const next = {
-    failed: 'Review what failed, then retry the work in the original chat.',
-    stopped: 'Review what finished, then continue the work in the original chat if needed.',
-    paused: 'Open the original chat to answer or resume the workflow.',
-    unconfirmed: 'Review the evidence, then rerun the check in the original chat if needed.',
-    attention: 'Review the recorded work, then continue in the original chat if needed.',
-  }[kind]
   const targetStates = kind === 'failed'
     ? ['failed']
     : kind === 'stopped' ? ['stopped', 'unknown'] : []
@@ -121,7 +152,7 @@ function attentionIssue(timeline, turns, agents) {
       if (Number.isFinite(at) !== Number.isFinite(bt)) return Number.isFinite(at) ? 1 : -1
       return String(a.agent_id || '').localeCompare(String(b.agent_id || ''))
     }).at(-1)
-  return { kind, reason, next, agent }
+  return { kind, reason, agent }
 }
 
 function AttentionPanel({ issue, onReview, onOpenChat }) {
@@ -132,25 +163,68 @@ function AttentionPanel({ issue, onReview, onOpenChat }) {
     paused: 'Paused',
     unconfirmed: 'Unconfirmed',
   }[issue.kind] || 'Needs review'
+  const primaryLabel = {
+    failed: 'Retry in chat',
+    stopped: 'Continue in chat',
+    paused: 'Resume in chat',
+    unconfirmed: 'Recheck in chat',
+  }[issue.kind] || 'Open chat'
   return (
     <section className="wf-flow-attention" aria-labelledby="wf-flow-attention-title">
-      <div className="wf-flow-attention-head">
-        <span className={`wf-flow-attention-kind is-${issue.kind}`}>{label}</span>
-        <h2 id="wf-flow-attention-title">Needs your input</h2>
+      <span className="wf-flow-attention-icon" aria-hidden="true">!</span>
+      <div className="wf-flow-attention-copy">
+        <div className="wf-flow-attention-head">
+          <h2 id="wf-flow-attention-title">Needs review</h2>
+          <span className={`wf-flow-attention-kind is-${issue.kind}`}>{label}</span>
+        </div>
+        <p className="wf-flow-attention-reason">{issue.reason}</p>
       </div>
-      <p className="wf-flow-attention-reason">{issue.reason}</p>
-      <p className="wf-flow-attention-next"><strong>Next:</strong> {issue.next}</p>
       <div className="wf-flow-attention-actions">
+        <button type="button" className="wf-btn wf-btn-primary" onClick={onOpenChat}>
+          {primaryLabel}
+        </button>
         {issue.agent && (
           <button type="button" className="wf-btn wf-attention-review" onClick={onReview}>
-            Review helper
+            Inspect trace
           </button>
         )}
-        <button type="button" className="wf-openchat wf-attention-openchat" onClick={onOpenChat}>
-          Open chat ↗
-        </button>
       </div>
     </section>
+  )
+}
+
+function CohortCard({ row, cohort, model, timeLabel, showTime, onExpand }) {
+  const agents = cohort.agentIds
+    .map((agentId) => model.agentsById.get(agentId))
+    .filter(Boolean)
+  const counts = stateCounts(agents)
+  const summary = compactStateSummary(counts)
+  return (
+    <li
+      className="wf-time-event is-agent_started is-cohort"
+      style={{ '--wf-y': `${row.y}px`, '--wf-x': `${xForLane(row.lane)}px` }}
+    >
+      <time className={`wf-time-clock${showTime ? '' : ' is-repeat'}`} dateTime={row.at || undefined}>
+        {showTime ? timeLabel : <span className="wf-sr-only">{timeLabel}</span>}
+      </time>
+      <div className="wf-time-event-body">
+        <button
+          type="button"
+          className="wf-cohort-launch"
+          onClick={onExpand}
+          aria-label={`${agents.length} helpers launched. ${summary}. Show individual task cards.`}
+        >
+          <span className="wf-cohort-junction" aria-hidden="true">
+            <i /><i /><i />
+          </span>
+            <span className="wf-cohort-copy">
+              <strong>{agents.length} helpers launched</strong>
+              <span>{summary || 'Status unavailable'}</span>
+              <span className="wf-cohort-action">Show all tasks</span>
+            </span>
+        </button>
+      </div>
+    </li>
   )
 }
 
@@ -443,28 +517,42 @@ function Inspector({ agent, model, storage, onClose, onOpenChat }) {
 export function Timeline({ timeline, turns, store, storage, onOpenChat }) {
   const model = useMemo(() => layoutTimeline(timeline, turns), [timeline, turns])
   const [selectedId, setSelectedId] = useState(() => store && store.selectedAgentId || null)
+  // Individual assignment bubbles are the primary representation: they answer
+  // "what is each helper doing?" without another click. Dense launch grouping
+  // remains available as an explicit owner choice.
+  const [cohortsExpanded, setCohortsExpanded] = useState(true)
   const triggerRef = useRef(null)
   const timelineRef = useRef(null)
   const selected = selectedId && model.agentsById.get(selectedId)
   const omittedAgents = model.retention.agents_omitted
   const omittedEvents = model.retention.events_omitted
-  const doneCount = model.agents.filter((agent) => agent.state === 'done').length
-  const running = model.agents.filter((agent) => agent.state === 'running').length
-  const donePercent = model.agents.length ? Math.round((doneCount / model.agents.length) * 100) : 100
+  const counts = useMemo(() => stateCounts(model.agents), [model.agents])
+  const incompleteCount = counts.failed + counts.stopped + counts.unknown
   const issue = useMemo(
     () => attentionIssue(timeline, turns, model.agents),
     [timeline, turns, model.agents],
   )
   const cohorts = useMemo(() => launchCohorts(model), [model])
+  const healthSegments = [
+    { key: 'done', label: 'done', count: counts.done },
+    { key: 'running', label: 'active', count: counts.running },
+    { key: 'failed', label: 'failed', count: counts.failed },
+    { key: 'stopped', label: 'stopped', count: counts.stopped },
+    { key: 'unknown', label: 'unknown', count: counts.unknown },
+  ].filter((segment) => segment.count > 0)
   const displayRows = useMemo(() => {
+    const visibleRows = cohortsExpanded ? model.rows : model.rows.filter((row) => {
+      const cohort = cohorts.byAgent.get(row.subject_agent_id)
+      return !cohort || row.event_id === cohort.firstEventId
+    })
     let previousTime = null
-    return model.rows.map((row) => {
+    return visibleRows.map((row) => {
       const timeLabel = row.at ? formatTimelineTime(row.at, row.time_quality) : 'Time unavailable'
       const showTime = timeLabel === 'Time unavailable' || timeLabel !== previousTime
       previousTime = timeLabel
       return { row, timeLabel, showTime }
     })
-  }, [model.rows])
+  }, [model.rows, cohorts, cohortsExpanded])
 
   useEffect(() => {
     if (selectedId && !model.agentsById.has(selectedId)) {
@@ -511,27 +599,49 @@ export function Timeline({ timeline, turns, store, storage, onOpenChat }) {
         />
         <div className="wf-time-overview">
           <div className="wf-time-overview-copy">
-            <span className="wf-time-overview-title">Helper path</span>
+            <span className="wf-time-overview-title">
+              {model.agents.length
+                ? `${model.agents.length} helper${model.agents.length === 1 ? '' : 's'}`
+                : 'Main agent only'}
+            </span>
             <span className="wf-time-overview-count">
-              {model.agents.length ? `${doneCount} of ${model.agents.length} done` : 'Main agent only'}
+              {counts.done} done
+              {counts.running ? ` · ${counts.running} active` : ''}
+              {incompleteCount ? ` · ${incompleteCount} incomplete` : ''}
             </span>
           </div>
           {model.agents.length > 0 && (
             <div
-              className="wf-time-progress"
-              role="progressbar"
-              aria-label="Helpers done"
-              aria-valuemin="0"
-              aria-valuemax={model.agents.length}
-              aria-valuenow={doneCount}
+              className="wf-time-health"
+              role="img"
+              aria-label={healthSegments.map((segment) => `${segment.count} ${segment.label}`).join(', ')}
             >
-              <span style={{ width: `${donePercent}%` }} />
+              {healthSegments.map((segment) => (
+                <span
+                  className={`is-${segment.key}`}
+                  key={segment.key}
+                  style={{ flexGrow: segment.count, flexBasis: 0 }}
+                />
+              ))}
             </div>
           )}
           {model.agents.length > 0 && (
             <div className="wf-time-facts" aria-label="Workflow summary">
+              {healthSegments.map((segment) => (
+                <span className={`is-${segment.key}`} key={segment.key}>
+                  <i aria-hidden="true" />{segment.count} {segment.label}
+                </span>
+              ))}
               <span>{model.maxLane} at once</span>
-              {running > 0 && <span className="is-running">{running} active</span>}
+              {cohorts.groups.length > 0 && (
+                <button
+                  type="button"
+                  className="wf-cohort-toggle"
+                  onClick={() => setCohortsExpanded((value) => !value)}
+                >
+                  {cohortsExpanded ? 'Group launches' : 'Show every task'}
+                </button>
+              )}
             </div>
           )}
           {(omittedAgents > 0 || omittedEvents > 0) && (
@@ -547,6 +657,20 @@ export function Timeline({ timeline, turns, store, storage, onOpenChat }) {
             <TimelineDrawing model={model} />
             <ol className="wf-time-events">
               {displayRows.map(({ row, timeLabel, showTime }) => {
+                const cohort = cohorts.byEvent.get(row.event_id)
+                if (!cohortsExpanded && cohort) {
+                  return (
+                    <CohortCard
+                      key={cohort.id}
+                      row={row}
+                      cohort={cohort}
+                      model={model}
+                      timeLabel={timeLabel}
+                      showTime={showTime}
+                      onExpand={() => setCohortsExpanded(true)}
+                    />
+                  )
+                }
                 const agent = model.agentsById.get(row.subject_agent_id)
                 const parentAgent = agent && agent.parent_agent_id
                   ? model.agentsById.get(agent.parent_agent_id) : null
@@ -559,7 +683,7 @@ export function Timeline({ timeline, turns, store, storage, onOpenChat }) {
                     parentAgent={parentAgent}
                     mainAgentId={model.mainAgentId}
                     span={span}
-                    cohort={cohorts.get(row.event_id)}
+                    cohort={cohorts.byEvent.get(row.event_id)}
                     selected={selectedId === row.subject_agent_id}
                     onSelect={(event) => selectAgent(row.subject_agent_id, event.currentTarget)}
                     timeLabel={timeLabel}

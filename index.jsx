@@ -210,6 +210,7 @@ export default function App({ appId, token }) {
         updatedLabel={updatedLabel}
         onRefresh={doRefresh}
         onOpenDetail={openDetail}
+        onOpenChat={openShellChat}
       />
     )
   }

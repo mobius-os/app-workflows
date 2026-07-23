@@ -2211,7 +2211,8 @@ _CONTEXT_LINE = re.compile(
   r"^(?:there is\b|the (?:owner|partner|platform|app|system)\b|in some chats\b|"
   r"symptoms?\b|background\b|known context\b|constraints?\b|rules?\b)", re.I)
 _EXPLICIT_TASK = re.compile(
-  r"^(?:priority\s+track|task|assignment|goal|scope|focus|subsystem|claim|finding)\s*"
+  r"^(?:priority\s+track|task|assignment|goal|scope|focus|subsystem|claim|finding|"
+  r"your\s+(?:area|task|assignment|focus)|workstream|deliverable)\s*"
   r"(?:—|–|-|:)\s*(.+)$", re.I)
 
 
@@ -2238,6 +2239,12 @@ def _json_object_after(raw: str, marker: str) -> Optional[dict]:
 
 def _structured_task(raw: str) -> str:
   """Prefer the unique subject embedded in known structured prompt shapes."""
+  app = re.search(r"(?im)^\s*app\s*:\s*([^\n(]+)", raw)
+  if app:
+    name = app.group(1).strip().rstrip(".")
+    if name:
+      return f"Audit {name}"
+
   place = _json_object_after(raw, r"\bplace\s*:")
   if place:
     name = str(place.get("name") or "").strip()
@@ -2250,6 +2257,30 @@ def _structured_task(raw: str) -> str:
     title = str(finding.get("title") or finding.get("name") or "").strip()
     if title:
       return f"Verify {title}"
+
+  hypothesis = _json_object_after(raw, r"\bhypothesis\s*:")
+  if hypothesis:
+    title = str(hypothesis.get("title") or hypothesis.get("claim") or "").strip()
+    if title:
+      return f"Verify {title}"
+
+  proposed_fix_object = _json_object_after(raw, r"\bproposed\s+fix\s*:")
+  if proposed_fix_object:
+    subject = str(
+      proposed_fix_object.get("change_description")
+      or proposed_fix_object.get("title")
+      or proposed_fix_object.get("id")
+      or "").strip()
+    if subject:
+      return f"Review {subject}"
+
+  proposed_fix = re.search(
+    r"(?im)^[ \t]*proposed\s+fix[ \t]*:[ \t]*(?:\n[ \t]*)?([^\n]+)",
+    raw)
+  if proposed_fix:
+    subject = proposed_fix.group(1).strip()
+    if subject and subject not in ("{", "["):
+      return f"Review {subject}"
   return ""
 
 
@@ -2278,12 +2309,21 @@ def _task_summary_ranked(text: Optional[str]) -> tuple[str, int]:
     if line and re.search(r"[A-Za-z0-9]", line):
       lines.append(line)
 
+  # Scan the whole prompt for an explicit assignment marker before accepting a
+  # generic uppercase heading. Long delegation prompts often begin with shared
+  # SYMPTOM / CONTEXT sections and put the differentiating "YOUR AREA" near the
+  # end; returning the first heading made several genuinely different helpers
+  # look as if they had received the same task.
   for line in lines:
     explicit = _EXPLICIT_TASK.match(line)
     if explicit and not re.match(r"^(?:context|constraints?|rules?)\b", line, re.I):
       return _clean_task_line(explicit.group(1)), 3
+
+  for line in lines:
     named = re.match(r"^[A-Z][A-Z\s_-]{3,}\s*(?:—|:|-)\s*(.+)$", line)
-    if named and not re.match(r"^(?:context|constraints?|rules?)\b", line, re.I):
+    if named and not re.match(
+        r"^(?:context|constraints?|rules?|symptoms?|evidence|confirmed cases?|"
+        r"background|files?|requirements?|known facts?)\b", line, re.I):
       return _clean_task_line(named.group(1)), 3
 
   imperative = next((line for line in lines if _TASK_VERBS.match(line)), "")
@@ -3205,34 +3245,71 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
         or helper.get("brief_full")
         or helper.get("lifecycle_state") in ("failed", "stopped", "running"))
   ]
-  # Exact repeated assignments are attempts at the same task at this skim
-  # layer. Draw one lane at the latest recorded attempt and carry the attempt
-  # count/state mix with it. This removes visual duplication without hiding a
-  # later failure or stop behind an earlier successful attempt.
-  grouped_helpers: dict[tuple[str, str], list[tuple[tuple, int, dict]]] = {}
+  # Only an identical full prompt can establish the same historical
+  # assignment. Short summaries are deliberately lossy and must never be used
+  # as identity: many ensemble prompts share context but differ in a trailing
+  # "YOUR AREA" section. Sequential failed/stopped/unknown launches of the exact
+  # prompt are attempts; overlapping launches and any launch after a completed
+  # task stay visible as distinct helpers.
+  grouped_helpers: dict[tuple[str, str], list[tuple[int, dict]]] = {}
   for insertion, helper in enumerate(eligible_helpers):
-    task = re.sub(r"\s+", " ", str(helper.get("ask") or "").strip()).casefold()
-    key = ((str(helper.get("parent_agent_id") or "main")), task)
-    if not task or task == "no brief was recorded":
-      key = (str(helper.get("agent_id")), task)
-    activity = max((
-      _iso_to_epoch(helper.get("last_activity_at")),
-      _iso_to_epoch(helper.get("ended_at")),
-      _iso_to_epoch(helper.get("started_at")),
-    ), key=lambda value: value if value is not None else float("-inf"))
-    score = (
-      activity if activity is not None else float("-inf"),
-      insertion,
-    )
-    grouped_helpers.setdefault(key, []).append((score, insertion, helper))
+    prompt = re.sub(
+      r"\s+", " ", str(helper.get("brief_full") or "").strip()).casefold()
+    key = (str(helper.get("parent_agent_id") or "main"), prompt)
+    if not prompt:
+      key = (str(helper.get("agent_id")), "")
+    grouped_helpers.setdefault(key, []).append((insertion, helper))
+
+  def _helper_epoch(helper: dict, *fields: str) -> Optional[float]:
+    values = [_iso_to_epoch(helper.get(field)) for field in fields]
+    finite = [value for value in values if value is not None]
+    return max(finite) if finite else None
+
+  logical_attempts: list[list[tuple[int, dict]]] = []
+  for assignment_rows in grouped_helpers.values():
+    def _start_key(row: tuple[int, dict]) -> tuple[float, int]:
+      value = _iso_to_epoch(row[1].get("started_at"))
+      if value is None:
+        value = _helper_epoch(row[1], "last_activity_at", "ended_at")
+      return (value if value is not None else float("inf"), row[0])
+
+    ordered = sorted(assignment_rows, key=_start_key)
+    partitions: list[list[tuple[int, dict]]] = []
+    for row in ordered:
+      if not partitions:
+        partitions.append([row])
+        continue
+      previous = partitions[-1][-1][1]
+      current = row[1]
+      previous_state = str(previous.get("lifecycle_state") or "unknown")
+      previous_end = _helper_epoch(
+        previous, "last_activity_at", "ended_at", "started_at")
+      current_start = _iso_to_epoch(current.get("started_at"))
+      sequential_retry = (
+        previous_state in ("failed", "stopped", "unknown")
+        and previous_end is not None
+        and current_start is not None
+        and current_start >= previous_end
+      )
+      if sequential_retry:
+        partitions[-1].append(row)
+      else:
+        partitions.append([row])
+    logical_attempts.extend(partitions)
+
   display_helpers = []
-  for attempts in grouped_helpers.values():
-    _, insertion, helper = max(attempts, key=lambda row: row[0])
+  for attempts in logical_attempts:
+    def _activity_key(row: tuple[int, dict]) -> tuple[float, int]:
+      value = _helper_epoch(
+        row[1], "last_activity_at", "ended_at", "started_at")
+      return (value if value is not None else float("-inf"), row[0])
+
+    insertion, helper = max(attempts, key=_activity_key)
     public_helper = dict(helper)
     public_helper["_display_insertion"] = insertion
     public_helper["_attempt_count"] = len(attempts)
     public_helper["_attempt_states"] = dict(Counter(
-      str(row[2].get("lifecycle_state") or "unknown") for row in attempts))
+      str(row[1].get("lifecycle_state") or "unknown") for row in attempts))
     display_helpers.append(public_helper)
   display_helpers.sort(key=lambda helper: helper["_display_insertion"])
   detail_omitted = max(0, len(merged) - len(display_helpers))
@@ -4479,20 +4556,26 @@ def selftest() -> int:
 
     duplicate_timeline = _build_timeline(
       "chat-duplicates", "codex", {
-        "done-a": {
-          "agent_id": "done-a", "parent_agent_id": "main",
-          "ask": "Review the parser", "lifecycle_state": "done",
-          "result": "Parser reviewed.", "ended_at": "2026-07-17T10:30:00Z",
+        "stopped-a": {
+          "agent_id": "stopped-a", "parent_agent_id": "main",
+          "ask": "Review the parser", "brief_full": "Review the parser carefully.",
+          "lifecycle_state": "stopped", "result": "",
+          "started_at": "2026-07-17T10:29:00Z",
+          "last_activity_at": "2026-07-17T10:30:00Z",
         },
-        "done-b": {
-          "agent_id": "done-b", "parent_agent_id": "main",
-          "ask": "Review the parser", "lifecycle_state": "done",
-          "result": "Parser reviewed again.", "ended_at": "2026-07-17T10:31:00Z",
+        "unknown-b": {
+          "agent_id": "unknown-b", "parent_agent_id": "main",
+          "ask": "Review the parser", "brief_full": "Review the parser carefully.",
+          "lifecycle_state": "unknown", "result": "",
+          "started_at": "2026-07-17T10:30:01Z",
+          "last_activity_at": "2026-07-17T10:31:00Z",
         },
         "failed-retry": {
           "agent_id": "failed-retry", "parent_agent_id": "main",
-          "ask": "Review the parser", "lifecycle_state": "failed",
-          "result": "The retry failed.", "ended_at": "2026-07-17T10:32:00Z",
+          "ask": "Review the parser", "brief_full": "Review the parser carefully.",
+          "lifecycle_state": "failed", "result": "The retry failed.",
+          "started_at": "2026-07-17T10:31:01Z",
+          "last_activity_at": "2026-07-17T10:32:00Z",
         },
       }, [], [], [])
     duplicate_agents = duplicate_timeline["agents"]
@@ -4500,9 +4583,72 @@ def selftest() -> int:
             and duplicate_agents[0]["agent_id"] == "failed-retry"
             and duplicate_agents[0]["state"] == "failed"
             and duplicate_agents[0]["attempt_count"] == 3
-            and duplicate_agents[0]["attempt_states"] == {"done": 2, "failed": 1}
+            and duplicate_agents[0]["attempt_states"]
+            == {"stopped": 1, "unknown": 1, "failed": 1}
             and duplicate_timeline["retention"]["agents_omitted"] == 2,
             f"resolved duplicate work is summarized without hiding an unresolved retry: {duplicate_agents}")
+
+    parallel_same_prompt = _build_timeline(
+      "chat-parallel-same-prompt", "codex", {
+        "parallel-a": {
+          "agent_id": "parallel-a", "parent_agent_id": "main",
+          "ask": "Review independently", "brief_full": "Review independently.",
+          "lifecycle_state": "unknown",
+          "started_at": "2026-07-17T11:00:00Z",
+          "last_activity_at": "2026-07-17T11:05:00Z",
+        },
+        "parallel-b": {
+          "agent_id": "parallel-b", "parent_agent_id": "main",
+          "ask": "Review independently", "brief_full": "Review independently.",
+          "lifecycle_state": "done",
+          "started_at": "2026-07-17T11:00:01Z",
+          "last_activity_at": "2026-07-17T11:04:00Z",
+        },
+      }, [], [], [])
+    _assert(len(parallel_same_prompt["agents"]) == 2,
+            "overlapping same-prompt helpers remain distinct ensemble members")
+
+    repeated_completed = _build_timeline(
+      "chat-repeated-completed", "codex", {
+        "completed-a": {
+          "agent_id": "completed-a", "parent_agent_id": "main",
+          "ask": "Review independently", "brief_full": "Review independently.",
+          "lifecycle_state": "done",
+          "started_at": "2026-07-17T12:00:00Z",
+          "last_activity_at": "2026-07-17T12:05:00Z",
+        },
+        "completed-b": {
+          "agent_id": "completed-b", "parent_agent_id": "main",
+          "ask": "Review independently", "brief_full": "Review independently.",
+          "lifecycle_state": "done",
+          "started_at": "2026-07-17T12:10:00Z",
+          "last_activity_at": "2026-07-17T12:15:00Z",
+        },
+      }, [], [], [])
+    _assert(len(repeated_completed["agents"]) == 2,
+            "same work repeated after completion remains two intentional runs")
+
+    lossy_shared_summary = _build_timeline(
+      "chat-shared-summary", "codex", {
+        "area-a": {
+          "agent_id": "area-a", "parent_agent_id": "main",
+          "ask": "Investigate the shared symptom",
+          "brief_full": "SYMPTOM: Missing reply.\nYOUR AREA: Trace persistence.",
+          "lifecycle_state": "stopped",
+          "started_at": "2026-07-17T13:00:00Z",
+          "last_activity_at": "2026-07-17T13:05:00Z",
+        },
+        "area-b": {
+          "agent_id": "area-b", "parent_agent_id": "main",
+          "ask": "Investigate the shared symptom",
+          "brief_full": "SYMPTOM: Missing reply.\nYOUR AREA: Trace rendering.",
+          "lifecycle_state": "done",
+          "started_at": "2026-07-17T13:10:00Z",
+          "last_activity_at": "2026-07-17T13:15:00Z",
+        },
+      }, [], [], [])
+    _assert(len(lossy_shared_summary["agents"]) == 2,
+            "lossy shared summaries never collapse distinct full assignments")
 
     # A lifecycle-only chat must render without any trace/chat-block evidence.
     life_only_raw = {"id": 20, "event_key": "only-start", "chat_id": "chatOnly",
@@ -4759,12 +4905,34 @@ def selftest() -> int:
       "Subsystem: shell frontend. Explore /data/shell/src and compare it to the spec.")
     _assert(subsystem_summary == "Shell frontend.",
             f"explicit subsystem beats reusable review instructions: {subsystem_summary!r}")
+    area_summary = _plain_ask(
+      "Investigate the missing replies.",
+      "SYMPTOM: In some chats a reply is missing.\n"
+      "CONFIRMED CASES: several historical runs.\n\n"
+      "YOUR AREA: Trace the Codex oversized-output completion path.")
+    _assert(area_summary == "Trace the Codex oversized-output completion path.",
+            f"trailing YOUR AREA disambiguates shared ensemble context: {area_summary!r}")
+    app_summary = _plain_ask(
+      "Component shape vs the canonical contract.",
+      "You are a READ-ONLY app auditor.\nApp: Reflection (id 56).\n"
+      "Review storage and theme behavior.")
+    _assert(app_summary == "Audit Reflection",
+            f"app-labelled audit prompts name the assigned app: {app_summary!r}")
     finding_summary = _plain_ask("{", (
       "You are an adversarial verifier. The reviewer reported this finding:\n\n"
       '{"title":"Queued messages can disappear during restart",'
       '"severity":"high","evidence":"repro"}'))
     _assert(finding_summary == "Verify Queued messages can disappear during restart",
             f"structured finding title becomes the task summary: {finding_summary!r}")
+    proposed_fix_summary = _plain_ask(
+      "Review the proposed fix.",
+      "You are a READ-ONLY adversarial reviewer.\n\nPROPOSED FIX:\n"
+      '{"id":"finalize-backstop","change_description":'
+      '"Persist a neutral lost-reply marker when finalization has no text."}')
+    _assert(
+      proposed_fix_summary
+      == "Review Persist a neutral lost-reply marker when finalization has no text.",
+      f"structured proposed-fix review names its distinct change: {proposed_fix_summary!r}")
     place_summary = _plain_ask(
       "Adversarially fact-check this Sarajevo dining spot.",
       'Fact-check the claim. Place: {"name":"Aščinica ASDŽ",'
