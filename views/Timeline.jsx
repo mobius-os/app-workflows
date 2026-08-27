@@ -24,7 +24,7 @@ function eventState(event, agent) {
 }
 
 function stateMeta(value) {
-  if (value === 'attention') return { cls: 'stopped', glyph: '!', label: 'needs input' }
+  if (value === 'attention') return { cls: 'unknown', glyph: '?', label: 'check incomplete' }
   return subStateMeta(value)
 }
 
@@ -37,9 +37,7 @@ const STATE_ICONS = {
 }
 
 export function WorkflowStateIcon({ state }) {
-  const StateIcon = state.label === 'needs input'
-    ? Warning
-    : (STATE_ICONS[state.cls] || Warning)
+  const StateIcon = STATE_ICONS[state.cls] || Warning
   return <StateIcon className="wf-state-icon" aria-hidden="true" />
 }
 
@@ -128,102 +126,6 @@ function compactStateSummary(counts) {
     counts.stopped && `${counts.stopped} stopped`,
     counts.unknown && `${counts.unknown} unknown`,
   ].filter(Boolean).join(' · ')
-}
-
-function attentionIssue(timeline, turns, agents) {
-  const runs = timeline && Array.isArray(timeline.main_runs) ? timeline.main_runs : []
-  const latestRun = [...runs].sort((a, b) => {
-    const at = Date.parse(a && a.started_at || '')
-    const bt = Date.parse(b && b.started_at || '')
-    if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt
-    return String(a && a.id || '').localeCompare(String(b && b.id || ''))
-  }).at(-1)
-  const runStatus = String(latestRun && latestRun.status || '').toLowerCase()
-  let result = ''
-  let reason = ''
-  if (['running', 'resume_pending'].includes(runStatus)) {
-    return null
-  } else if (runStatus === 'failed') {
-    result = "couldn't complete"
-    reason = 'The main agent could not complete this workflow.'
-  } else if (['stopped', 'interrupted', 'cancelled', 'canceled'].includes(runStatus)) {
-    result = 'stopped'
-    reason = 'The main work stopped before a completion was recorded.'
-  } else if (['parked', 'parked_notified'].includes(runStatus)) {
-    result = 'paused'
-    reason = 'The workflow is paused and may be waiting for your input.'
-  } else {
-    const turn = (Array.isArray(turns) ? turns : []).at(-1)
-    if (!turn || turn.status !== 'attention') return null
-    result = turn.result || 'attention'
-    reason = turn.flag || 'This workflow has an unresolved result.'
-  }
-  const kind = {
-    "couldn't complete": 'failed',
-    stopped: 'stopped',
-    paused: 'paused',
-    'not confirmed': 'unconfirmed',
-  }[result] || 'attention'
-  const targetStates = kind === 'failed'
-    ? ['failed']
-    : kind === 'stopped' ? ['stopped', 'unknown'] : []
-  const rootAttention = [
-    'failed', 'stopped', 'interrupted', 'cancelled', 'canceled',
-    'parked', 'parked_notified',
-  ].includes(runStatus)
-  const latestRunId = String(latestRun && latestRun.id || '')
-  const targetAgents = rootAttention
-    ? agents.filter((candidate) => (
-      latestRunId && String(candidate.chat_run_id || '') === latestRunId
-    ))
-    : agents
-  const agent = targetAgents.filter((candidate) => targetStates.includes(candidate.state))
-    .sort((a, b) => {
-      const at = Date.parse(a.last_activity_at || '')
-      const bt = Date.parse(b.last_activity_at || '')
-      if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt
-      if (Number.isFinite(at) !== Number.isFinite(bt)) return Number.isFinite(at) ? 1 : -1
-      return String(a.agent_id || '').localeCompare(String(b.agent_id || ''))
-    }).at(-1)
-  return { kind, reason, agent }
-}
-
-function AttentionPanel({ issue, onReview, onOpenChat }) {
-  if (!issue) return null
-  const label = {
-    failed: 'Failed',
-    stopped: 'Stopped',
-    paused: 'Paused',
-    unconfirmed: 'Unconfirmed',
-  }[issue.kind] || 'Needs review'
-  const primaryLabel = {
-    failed: 'Retry in chat',
-    stopped: 'Continue in chat',
-    paused: 'Resume in chat',
-    unconfirmed: 'Recheck in chat',
-  }[issue.kind] || 'Open chat'
-  return (
-    <section className="wf-flow-attention" aria-labelledby="wf-flow-attention-title">
-      <span className="wf-flow-attention-icon" aria-hidden="true">!</span>
-      <div className="wf-flow-attention-copy">
-        <div className="wf-flow-attention-head">
-          <h2 id="wf-flow-attention-title">Needs review</h2>
-          <span className={`wf-flow-attention-kind is-${issue.kind}`}>{label}</span>
-        </div>
-        <p className="wf-flow-attention-reason">{issue.reason}</p>
-      </div>
-      <div className="wf-flow-attention-actions">
-        <button type="button" className="wf-btn wf-btn-primary" onClick={onOpenChat}>
-          {primaryLabel}
-        </button>
-        {issue.agent && (
-          <button type="button" className="wf-btn wf-attention-review" onClick={onReview}>
-            Inspect trace
-          </button>
-        )}
-      </div>
-    </section>
-  )
 }
 
 function CohortCard({ row, cohort, model, timeLabel, showTime, onExpand }) {
@@ -568,10 +470,6 @@ export function Timeline({ timeline, turns, store, storage, onOpenChat }) {
   const omittedEvents = model.retention.events_omitted
   const counts = useMemo(() => stateCounts(model.agents), [model.agents])
   const incompleteCount = counts.failed + counts.stopped + counts.unknown
-  const issue = useMemo(
-    () => attentionIssue(timeline, turns, model.agents),
-    [timeline, turns, model.agents],
-  )
   const cohorts = useMemo(() => launchCohorts(model), [model])
   const healthSegments = [
     { key: 'done', label: 'done', count: counts.done },
@@ -632,11 +530,6 @@ export function Timeline({ timeline, turns, store, storage, onOpenChat }) {
   return (
     <>
       <section ref={timelineRef} className="wf-time-section" aria-label="Chronological agent timeline" tabIndex={-1}>
-        <AttentionPanel
-          issue={issue}
-          onReview={(event) => issue.agent && selectAgent(issue.agent.agent_id, event.currentTarget)}
-          onOpenChat={onOpenChat}
-        />
         <div className="wf-time-overview">
           <div className="wf-time-overview-copy">
             <span className="wf-time-overview-title">

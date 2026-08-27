@@ -79,11 +79,12 @@ export const CSS = `
 .wf-header {
   flex: 0 0 auto; display: flex; align-items: center; gap: 11px;
   min-height: 52px;
-  padding: max(11px, env(safe-area-inset-top)) 16px 11px;
-  background: var(--bg); border-bottom: 1px solid var(--border);
+  padding: 0;
+  background: var(--bg);
 }
 .wf-header-inner {
-  width: 100%; display: flex; align-items: center; gap: 11px;
+  width: 100%; max-width: 760px; margin-inline: auto; display: flex; align-items: center; gap: 11px;
+  padding: max(11px, env(safe-area-inset-top)) 16px 11px; border-bottom: 1px solid var(--border);
 }
 .wf-brand { display: flex; align-items: center; gap: 11px; min-width: 0; flex: 1 1 auto; }
 .wf-mark {

@@ -17,14 +17,17 @@ export function providerLabel(provider) {
 }
 
 // ---------------------------------------------------------------------------
-// Ambient status — the three journal/turn states and their dot styling.
-// `done` is the quiet default; `attention` is the amber "needs input"; `run`
-// is in-progress. Anything unknown stays neutral rather than inventing success.
+// Ambient status — concrete lifecycle states only. `waiting` is reserved for
+// a durable question or secure-input receipt; internal uncertainty never
+// becomes owner work. Old `attention` rows render as completed history until
+// the next refresh migrates their stored index.
 // ---------------------------------------------------------------------------
 
 export function statusDot(status) {
-  if (status === 'done') return 'done'
-  if (status === 'attention') return 'attn'
+  if (status === 'done' || status === 'attention') return 'done'
+  if (status === 'waiting') return 'wait'
+  if (status === 'failed') return 'failed'
+  if (status === 'stopped') return 'stopped'
   if (status === 'running') return 'run'
   return 'neutral'
 }
@@ -52,6 +55,7 @@ export function avatarFor(kind) {
 export function subStateMeta(state) {
   if (state === 'done') return { cls: 'done', glyph: '✓', label: 'done' }
   if (state === 'running') return { cls: 'run', glyph: '◌', label: 'running' }
+  if (state === 'waiting') return { cls: 'waiting', glyph: '!', label: 'waiting for you' }
   if (state === 'failed') return { cls: 'failed', glyph: '✕', label: 'failed' }
   if (state === 'stopped') return { cls: 'stopped', glyph: '‖', label: 'stopped' }
   return { cls: 'unknown', glyph: '?', label: 'status unavailable' }

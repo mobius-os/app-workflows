@@ -112,11 +112,11 @@ MAX_LIFECYCLE_CACHE_EVENTS_PER_CHAT = 2_000
 MAX_TIMELINE_EVENTS_PER_CHAT = MAX_TIMELINE_AGENTS * 3 + 40
 
 SCHEMA_NOTES = """\
-index.json  {schema, updated_at, needs_attention:[{chat_id,title,outcome,kind,reason,next_action,agent_id}], entries:[...], history:{chats_omitted}}
+index.json  {schema, updated_at, entries:[...], history:{chats_omitted}}
 chats/<id> {schema, chat_id, provider, title, outcome, prompt_full, ts, turns:[...], timeline:{...,retention}}
   turn.note: display-only completeness line ("N of M helpers never reported a
   result…") when a fleet's own journal proves more helpers launched than ever
-  returned. Never a flag: a delivered turn stays out of needs_attention.
+  returned. Never an owner-action signal: a delivered turn stays completed.
 helpers/<id> {schema, agent_id, chat_id, brief_full}
 """
 
@@ -1298,8 +1298,9 @@ def fetch_session_links(base_url: str, token: str) -> tuple[bool, dict[tuple, st
 
 
 def fetch_chats(base_url: str, token: str) -> tuple[bool, dict[str, dict]]:
-  """GET /api/chats — the roster of chats with title + created_by_app_id. The
-  list endpoint omits provider, so provider is filled from the session trace.
+  """GET /api/chats — the roster of chats with title, activity and the
+  durable open-question marker. The list endpoint omits provider, so provider
+  is filled from the session trace.
 
   Returns `(ok, chats)`. `ok` is False on any fetch FAILURE (missing token,
   network error, timeout, non-2xx, or a non-list body) — the caller must NOT
@@ -1318,6 +1319,8 @@ def fetch_chats(base_url: str, token: str) -> tuple[bool, dict[str, dict]]:
         "provider": c.get("provider"),
         "created_by_app_id": c.get("created_by_app_id"),
         "activity_at": c.get("activity_at") or c.get("updated_at"),
+        "waiting_for_input": bool(c.get("pending_question_id")),
+        "input_kind": "question" if c.get("pending_question_id") else None,
       }
   return True, out
 
@@ -1933,7 +1936,7 @@ def _walk_chat(messages: list, scope: str = "") -> tuple[list[dict], list[dict]]
 
   Schema v3 deliberately includes a tool turn even when it did not spawn a helper: the
   owner's requested Beat Machine validator example is such a turn, and omitting
-  it would make the outcome journal skip the exact handback that needs review.
+  it would make the outcome journal skip the exact handback that records failure.
   Private `_facts`/`_agent_ids` fields are bounded, scrubbed parse evidence; the
   public document is derived from them later after downstream helpers are joined.
   """
@@ -1999,12 +2002,36 @@ def _walk_chat(messages: list, scope: str = "") -> tuple[list[dict], list[dict]]
   return helpers, turns
 
 
+def _pending_secure_input(messages: list) -> bool:
+  """Whether the durable transcript contains a secure-input card awaiting the owner.
+
+  Secure values never enter the transcript; this reads only the request id and
+  safe receipt status already rendered by the chat UI. Later statuses for the
+  same request win so filled, settled, cancelled and expired cards cannot keep
+  a workflow marked as waiting.
+  """
+  states: dict[str, str] = {}
+  for msg in messages:
+    if not isinstance(msg, dict):
+      continue
+    for block in msg.get("blocks") or []:
+      if not isinstance(block, dict) or block.get("type") != "secure_input":
+        continue
+      request_id = str(block.get("request_id") or "")
+      if request_id:
+        states[request_id] = str(block.get("status") or "pending").lower()
+  return any(status == "pending" for status in states.values())
+
+
 def scan_chat_helpers(base_url: str, token: str, chats_meta: dict[str, dict],
                       scanned: dict[str, str], budget: Budget,
                       max_fetches: Optional[int] = None
-                      ) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
-  """`(chat_id -> [helper record], chat_id -> [timeline turn])` for chats whose
-  transcript contains Agent blocks. Bounded and progressive on the SAME cursor
+                      ) -> tuple[dict[str, list[dict]], dict[str, list[dict]],
+                                 dict[str, str], set[str]]:
+  """Helper/turn evidence plus concrete pending secure-input receipts.
+
+  Returns helper records, timeline turns, pending-input kinds and the set of
+  rescanned chat ids. Scanning is bounded and progressive on the SAME cursor
   contract as build_tooluse_map: most-recently-active first, a chat is only
   marked scanned after a successful fetch, and it is re-scanned when its activity
   advances. Helpers and turns come from one walk (`_walk_chat`) so a branch and
@@ -2023,6 +2050,7 @@ def scan_chat_helpers(base_url: str, token: str, chats_meta: dict[str, dict],
       max_fetches = 40
   out: dict[str, list[dict]] = {}
   turns_out: dict[str, list[dict]] = {}
+  inputs_out: dict[str, str] = {}
   rescanned: set[str] = set()
   fetched = 0
   ordered = sorted(chats_meta.items(),
@@ -2040,15 +2068,18 @@ def scan_chat_helpers(base_url: str, token: str, chats_meta: dict[str, dict],
       continue
     scanned[chat_id] = activity
     rescanned.add(chat_id)
-    helpers, turns = _walk_chat(payload.get("messages", []), scope=chat_id)
+    messages = payload.get("messages", [])
+    helpers, turns = _walk_chat(messages, scope=chat_id)
     if helpers:
       out[chat_id] = helpers
     if turns:
       turns_out[chat_id] = turns
+    if _pending_secure_input(messages):
+      inputs_out[chat_id] = "secure_input"
   # `rescanned` is every chat freshly walked this slice, empty results included,
   # so the caller can DROP stale state for a chat whose spawns were later
   # compacted away — an overlay-only merge could never clear it otherwise.
-  return out, turns_out, rescanned
+  return out, turns_out, inputs_out, rescanned
 
 
 def _api_get_json(base_url: str, path: str, token: str) -> tuple[Optional[int], object]:
@@ -2904,7 +2935,7 @@ def _build_v3_turn(raw: dict, helpers: dict[str, dict],
     flag = f"The recorded report for {area} hedged the result, so it was not confirmed."
   elif "failed" in states and not delivery:
     status, result = "attention", "couldn't complete"
-    flag = "A helper reported a failure, so this turn needs your input."
+    flag = "A helper failed before returning a usable result."
   elif "running" in states:
     status, result = "running", "in progress"
   elif "stopped" in lifecycle_states and not delivery:
@@ -3615,7 +3646,11 @@ def build_documents(model: dict, attribution: Attribution, now: float,
       "schema": SCHEMA_VERSION, "chat_id": chat_id, "provider": provider,
       "title": clip_line(title, 120), "outcome": summary_turn["outcome"],
       "prompt_full": clip_markdown(first_request, FULL_PROMPT_CAP) or "",
-      "ts": ts, "turns": turns,
+      "ts": ts,
+      "waiting_for_input": bool(
+        attribution.chats.get(chat_id, {}).get("waiting_for_input")),
+      "input_kind": attribution.chats.get(chat_id, {}).get("input_kind"),
+      "turns": turns,
       "timeline": _build_timeline(
         chat_id, provider, merged, retained_platform_events,
         runs_by_chat.get(chat_id, []), turns,
@@ -3666,145 +3701,59 @@ def _retain_recent_chats(chats: dict[str, dict], helpers: dict[str, dict]
 
 
 def _document_status(doc: dict) -> tuple[str, str]:
-  """Owner-facing status with the latest durable root run as a hard gate."""
+  """Small, evidence-backed workflow state for the observation journal.
+
+  Owner attention is never inferred from failed checks or cautious prose. A
+  workflow is waiting only when the platform exposes a live question/secure
+  input receipt; failure requires a failed root run or a helper failure that
+  ended without a usable delivery.
+  """
+  if doc.get("waiting_for_input"):
+    return "waiting", "waiting for you"
   status, result = _chat_status(doc.get("turns") or [])
   runs = ((doc.get("timeline") or {}).get("main_runs") or [])
   if not runs:
-    return status, result
+    if status == "running":
+      return "running", "active"
+    if result == "couldn't complete":
+      return "failed", "failed"
+    if result == "stopped":
+      return "stopped", "stopped"
+    return "done", "completed"
   latest = max(runs, key=lambda run: (
     _iso_to_epoch(run.get("started_at")) or float("-inf"), str(run.get("id") or "")))
   run_status = str(latest.get("status") or "").lower()
   if run_status in ("running", "resume_pending"):
-    return "running", "in progress"
+    return "running", "active"
   if run_status == "failed":
-    return "attention", "couldn't complete"
+    return "failed", "failed"
   if run_status in ("stopped", "interrupted", "cancelled", "canceled"):
-    return "attention", "stopped"
+    return "stopped", "stopped"
   if run_status in ("parked", "parked_notified"):
-    return "attention", "paused"
-  # A clean root completion does not erase a helper failure already captured
-  # in the trace-derived turn; it only prevents older root failures winning.
-  return status, result
-
-
-def _attention_detail(doc: dict, status: str, result: str) -> Optional[dict]:
-  """Turn an amber status into an owner-readable reason and next step.
-
-  Reflection's report contract uses Trigger / Why / Next. Workflows keeps that
-  same information density in one compact record: `reason` explains the
-  evidence, `next_action` says what the owner can do, and `agent_id` provides a
-  direct drill-in target when one helper is responsible.
-  """
-  if status != "attention":
-    return None
-  turns = doc.get("turns") or []
-  runs = (doc.get("timeline") or {}).get("main_runs") or []
-  latest_run = max(runs, key=lambda run: (
-    _iso_to_epoch(run.get("started_at")) or float("-inf"),
-    str(run.get("id") or ""),
-  ), default={})
-  root_status = str(latest_run.get("status") or "").lower()
-  root_attention = root_status in {
-    "failed", "stopped", "interrupted", "cancelled", "canceled",
-    "parked", "parked_notified",
-  }
-  # A root lifecycle failure should use its own neutral explanation. An older
-  # turn can have the same result label while referring to unrelated work.
-  turn = {} if root_attention else next((
-    row for row in reversed(turns)
-    if row.get("status") == "attention" and row.get("result") == result
-  ), {})
-  default_reasons = {
-    "couldn't complete": "A helper failed before returning a usable result.",
-    "stopped": "The work stopped before a completion result was recorded.",
-    "paused": "The workflow is paused and may be waiting for your input.",
-    "not confirmed": "The result was recorded, but its verification did not complete.",
-  }
-  root_reasons = {
-    "failed": "The main agent could not complete this workflow.",
-    "stopped": "The main work stopped before a completion was recorded.",
-    "interrupted": "The main work stopped before a completion was recorded.",
-    "cancelled": "The main work stopped before a completion was recorded.",
-    "canceled": "The main work stopped before a completion was recorded.",
-    "parked": "The workflow is paused and may be waiting for your input.",
-    "parked_notified": "The workflow is paused and may be waiting for your input.",
-  }
-  kind = {
-    "couldn't complete": "failed",
-    "stopped": "stopped",
-    "paused": "paused",
-    "not confirmed": "unconfirmed",
-  }.get(result, "attention")
-  next_actions = {
-    "failed": "Review what failed, then retry the work in the original chat.",
-    "stopped": "Review what finished, then continue the work in the original chat if needed.",
-    "paused": "Open the original chat to answer or resume the workflow.",
-    "unconfirmed": "Review the evidence, then rerun the check in the original chat if needed.",
-    "attention": "Review the recorded work, then continue in the original chat if needed.",
-  }
-  agents = (doc.get("timeline") or {}).get("agents") or []
-  wanted_states = {
-    "failed": ("failed",),
-    "stopped": ("stopped", "unknown"),
-  }.get(kind, ())
-  latest_run_id = str(latest_run.get("id") or "")
-  # A root-run failure belongs to that run, not to any older failed helper in
-  # the same chat. Only offer a direct helper drill-in when lifecycle evidence
-  # ties it to the exact latest run; otherwise the original-chat action is the
-  # honest target.
-  if root_attention:
-    targets = [
-      agent for agent in agents
-      if (latest_run_id
-          and str(agent.get("chat_run_id") or "") == latest_run_id
-          and agent.get("state") in wanted_states)
-    ]
-  else:
-    targets = [agent for agent in agents if agent.get("state") in wanted_states]
-  target = max(targets, key=lambda agent: (
-    _iso_to_epoch(agent.get("last_activity_at"))
-    or _iso_to_epoch(agent.get("ended_at"))
-    or _iso_to_epoch(agent.get("started_at"))
-    or float("-inf"),
-    str(agent.get("agent_id") or ""),
-  ), default=None)
-  return {
-    "kind": kind,
-    "reason": clip_line(str(turn.get("flag") or root_reasons.get(root_status)
-      or default_reasons.get(result, "This workflow has an unresolved result.")), 240),
-    "next_action": next_actions[kind],
-    "agent_id": target.get("agent_id") if target else None,
-  }
+    return "stopped", "paused"
+  if result == "couldn't complete":
+    return "failed", "failed"
+  return "done", "completed"
 
 
 def _build_index(chats: dict[str, dict], helpers_out: dict[str, dict], now: float,
                  chats_omitted: int = 0) -> dict:
   entries: list[dict] = []
-  needs_attention: list[dict] = []
   for chat_id, doc in chats.items():
     status, result = _document_status(doc)
     row = {
       "chat_id": chat_id, "provider": doc["provider"], "title": doc["title"],
       "outcome": doc["outcome"], "result": result,
       "status": status,
+      "waiting_for_input": bool(doc.get("waiting_for_input")),
+      "input_kind": doc.get("input_kind"),
       "tasks": len((doc.get("timeline") or {}).get("agents") or []),
       "ts": doc.get("ts"),
     }
     entries.append(row)
-    attention = _attention_detail(doc, status, result)
-    if attention:
-      needs_attention.append({
-        "chat_id": chat_id, "title": doc["title"], "outcome": doc["outcome"],
-        **attention,
-      })
   entries.sort(key=lambda row: row.get("ts") or "", reverse=True)
-  attention_by_id = {row["chat_id"]: row for row in needs_attention}
-  needs_attention = [
-    attention_by_id[row["chat_id"]]
-    for row in entries if row["chat_id"] in attention_by_id
-  ]
   return {"schema": SCHEMA_VERSION, "updated_at": _epoch_to_iso(now),
-          "needs_attention": needs_attention, "entries": entries,
+          "entries": entries,
           "history": {"chats_omitted": max(0, int(chats_omitted))}}
 
 
@@ -4195,17 +4144,23 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   chat_helpers_state = _clean_chat_helpers_state(
     load_json(state_dir / "chat-helpers.json", {}))
   chat_turns_state = load_json(state_dir / "chat-turns.json", {})
+  chat_inputs_path = state_dir / "chat-inputs.json"
+  chat_inputs_state = load_json(chat_inputs_path, {})
+  if not isinstance(chat_inputs_state, dict):
+    chat_inputs_state = {}
   if reset_owner_state:
     helper_scanned = {}
     chat_helpers_state = {}
     chat_turns_state = {}
+    chat_inputs_state = {}
   else:
     # Idempotent shape migration: safe even if a previous degraded run updated
     # model.json before owner API access returned and the turn cache was saved.
     chat_turns_state = _compact_chat_turns_state(chat_turns_state)
-  new_helpers, new_turns, rescanned = scan_chat_helpers(
+  new_helpers, new_turns, new_inputs, rescanned = scan_chat_helpers(
     base_url, service_token, chats_meta, helper_scanned, budget)
   chat_helpers_state.update(new_helpers)
+  chat_inputs_state.update(new_inputs)
   # A rescanned chat replaces its turns wholesale (the transcript is append-only,
   # so the fresh walk is authoritative); chats not rescanned this slice keep the
   # turns already on disk.
@@ -4217,6 +4172,18 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
       chat_helpers_state.pop(cid, None)
     if cid not in new_turns:
       chat_turns_state.pop(cid, None)
+    if cid not in new_inputs:
+      chat_inputs_state.pop(cid, None)
+
+  # The chat roster is authoritative for question cards; the bounded transcript
+  # scan contributes only safe secure-input receipt state. Neither pauses,
+  # failures nor cautious prose are allowed to invent owner work.
+  for cid, meta in chats_meta.items():
+    if meta.get("waiting_for_input"):
+      meta["input_kind"] = "question"
+    elif chat_inputs_state.get(cid) == "secure_input":
+      meta["waiting_for_input"] = True
+      meta["input_kind"] = "secure_input"
 
   attribution = Attribution(links, tooluse_map, chats_meta)
   index, chats, helpers, unlinked = build_documents(
@@ -4237,6 +4204,7 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
   save_json(helper_scanned_path, helper_scanned)
   save_json(state_dir / "chat-helpers.json", chat_helpers_state)
   save_json(state_dir / "chat-turns.json", chat_turns_state)
+  save_json(chat_inputs_path, chat_inputs_state)
   if lifecycle_state:
     save_json(lifecycle_path, lifecycle_state)
 
@@ -4442,24 +4410,22 @@ def selftest() -> int:
     # --- schema-shape asserts (json-schema-ish) ---
     _assert(index["schema"] == SCHEMA_VERSION, "index schema")
     _assert(isinstance(index["updated_at"], str), "index.updated_at is ISO")
-    _assert(set(index) == {"schema", "updated_at", "needs_attention", "entries", "history"},
+    _assert(set(index) == {"schema", "updated_at", "entries", "history"},
             f"index keys: {set(index)}")
     _assert(index["history"] == {"chats_omitted": 0}, "journal retention is explicit")
     _assert(len(index["entries"]) == 2,
             f"expected 2 chats, got {len(index['entries'])}")
     for row in index["entries"]:
       _assert(set(row) == {"chat_id", "provider", "title", "outcome",
-                           "result", "status", "tasks", "ts"},
+                           "result", "status", "waiting_for_input", "input_kind",
+                           "tasks", "ts"},
               f"index entry keys: {set(row)}")
-    for row in index["needs_attention"]:
-      _assert(set(row) == {"chat_id", "title", "outcome", "kind", "reason",
-                           "next_action", "agent_id"},
-              f"attention entry keys: {set(row)}")
 
     doc_a = chats["chatA"]
     _assert(doc_a["provider"] == "claude", "chatA provider")
     _assert(set(doc_a) == {"schema", "chat_id", "provider", "title", "outcome",
-                           "prompt_full", "ts", "turns", "timeline"},
+                           "prompt_full", "ts", "waiting_for_input", "input_kind",
+                           "turns", "timeline"},
             f"chat keys: {set(doc_a)}")
     _assert(set(doc_a["timeline"]) == {
       "main_agent_id", "main_runs", "agents", "events", "retention"},
@@ -4613,15 +4579,9 @@ def selftest() -> int:
          "started_at": "2026-07-17T10:10:00Z", "ended_at": "2026-07-17T10:10:01Z"},
       ]},
     }}, {}, now)
-    _assert(failed_index["entries"][0]["status"] == "attention"
-            and failed_index["needs_attention"],
-            "latest durable root failure drives the journal and attention strip")
-    failed_attention = failed_index["needs_attention"][0]
-    _assert(failed_attention["kind"] == "failed"
-            and "main agent" in failed_attention["reason"].lower()
-            and "original chat" in failed_attention["next_action"]
-            and failed_attention["agent_id"] is None,
-            f"attention has an owner-readable reason and next step: {failed_attention}")
+    _assert(failed_index["entries"][0]["status"] == "failed"
+            and failed_index["entries"][0]["result"] == "failed",
+            "latest durable root failure remains visible without an attention inbox")
 
     same_run_failure_index = _build_index({"chatA": {
       **platform_doc,
@@ -4640,9 +4600,8 @@ def selftest() -> int:
         ],
       },
     }}, {}, now)
-    _assert(
-      same_run_failure_index["needs_attention"][0]["agent_id"] == "opaque-a",
-      "root attention links a helper only when it belongs to the exact failed run")
+    _assert(same_run_failure_index["entries"][0]["status"] == "failed",
+            "a failed root run stays failed when its helper also failed")
 
     delivered_after_failure = _build_v3_turn({
       "_agent_ids": ["recoverable"], "_tools": [],
@@ -4666,9 +4625,29 @@ def selftest() -> int:
          "started_at": "2026-07-17T10:20:00Z", "ended_at": None},
       ]},
     }}, {}, now)
-    _assert(running_index["entries"][0]["status"] == "running"
-            and not running_index["needs_attention"],
-            "active work is visible but does not masquerade as owner attention")
+    _assert(running_index["entries"][0]["status"] == "running",
+            "active work is visible without an owner-attention concept")
+
+    waiting_index = _build_index({"chatA": {
+      **platform_doc,
+      "waiting_for_input": True,
+      "input_kind": "question",
+    }}, {}, now)
+    waiting_entry = waiting_index["entries"][0]
+    _assert(waiting_entry["status"] == "waiting"
+            and waiting_entry["result"] == "waiting for you"
+            and waiting_entry["input_kind"] == "question",
+            f"only a concrete open input becomes waiting: {waiting_entry}")
+
+    secure_messages = [{"role": "assistant", "blocks": [{
+      "type": "secure_input", "request_id": "secure-1", "status": "pending",
+      "title": "Connect service", "fields": [{"name": "key", "label": "API key"}],
+    }]}]
+    _assert(_pending_secure_input(secure_messages),
+            "a pending secure-input receipt is concrete owner input")
+    secure_messages[0]["blocks"][0]["status"] = "completed"
+    _assert(not _pending_secure_input(secure_messages),
+            "a settled secure-input receipt no longer waits for the owner")
 
     duplicate_timeline = _build_timeline(
       "chat-duplicates", "codex", {

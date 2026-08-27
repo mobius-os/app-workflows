@@ -29,7 +29,8 @@ function rootState(turns) {
   return 'stopped'
 }
 
-function timelineRootState(timeline, turns) {
+function timelineRootState(timeline, turns, waitingForInput) {
+  if (waitingForInput) return 'waiting'
   const agents = timeline && Array.isArray(timeline.agents) ? timeline.agents : []
   const runs = timeline && Array.isArray(timeline.main_runs) ? timeline.main_runs : []
   // The header describes where the chat is now. Historical failures and
@@ -94,10 +95,13 @@ export function ChatDetail({ storage, chatId, chatMeta, viewStates, onBack, onOp
   const timeline = (detail && detail.timeline && typeof detail.timeline === 'object') ? detail.timeline : null
   const timelineAgents = timeline && Array.isArray(timeline.agents) ? timeline.agents : []
   const timelineEvents = timeline && Array.isArray(timeline.events) ? timeline.events : []
+  const waitingForInput = Boolean(
+    (detail && detail.waiting_for_input) || (chatMeta && chatMeta.waiting_for_input)
+  )
   const loaded = detail !== undefined
   const isEmpty = loaded && turns.length === 0 && timelineAgents.length === 0 && timelineEvents.length === 0
   const when = fmtShortDate((detail && detail.ts) || (chatMeta && chatMeta.ts))
-  const state = subStateMeta(timelineRootState(timeline, turns))
+  const state = subStateMeta(timelineRootState(timeline, turns, waitingForInput))
 
   useLayoutEffect(() => {
     if (!loaded || isEmpty) return

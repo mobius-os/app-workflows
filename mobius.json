@@ -1,8 +1,8 @@
 {
   "id": "workflows",
   "name": "Workflows",
-  "version": "2.3.4",
-  "description": "An outcome journal for background work: skim completed outcomes, items that need attention, and each helper's assignment.",
+  "version": "2.3.5",
+  "description": "A timeline of background work: see what ran, which helpers were created, and how each attempt ended.",
   "author": "mobius-os",
   "license": "MIT",
   "homepage": "https://github.com/mobius-os/app-workflows",
