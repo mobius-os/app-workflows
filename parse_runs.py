@@ -1439,6 +1439,7 @@ def _normalized_lifecycle_run(raw: dict) -> Optional[dict]:
     return None
   return {
     "id": run_id, "chat_id": chat_id,
+    "physical_run_id": _bounded_lifecycle_id(raw.get("physical_run_id")),
     "update_id": update_id,
     "provider": clip_line(str(raw.get("provider") or ""), 32),
     "status": status,
@@ -3329,6 +3330,73 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
                     platform_events: list[dict], platform_runs: list[dict],
                     turns: list[dict], agents_omitted: int = 0,
                     events_omitted: int = 0) -> dict:
+  # A helper cannot outlive its physical root process. Providers may omit a
+  # positive terminal notification when that process completes or is
+  # interrupted, so start-only platform evidence must not remain "running"
+  # forever. Preserve any stronger trace/provider terminal state; settle only
+  # the unresolved running projection from the durable root-run snapshot.
+  terminal_run_states = {
+    "completed", "failed", "stopped", "interrupted", "cancelled", "canceled",
+    "parked", "parked_notified", "deleted",
+  }
+  run_by_id: dict[str, dict] = {}
+  for run in platform_runs:
+    for key in (run.get("id"), run.get("physical_run_id")):
+      if key:
+        run_by_id[str(key)] = run
+  unsettled_root_exists = any(
+    str(run.get("status") or "").lower() not in terminal_run_states
+    for run in platform_runs
+  )
+  terminal_boundaries = sorted(
+    (
+      ended_epoch,
+      run,
+    )
+    for run in platform_runs
+    if str(run.get("status") or "").lower() in terminal_run_states
+    for ended_epoch in [_iso_to_epoch(run.get("ended_at"))]
+    if ended_epoch is not None
+  )
+  for helper in merged.values():
+    if str(helper.get("lifecycle_state") or "") != "running":
+      continue
+    run_id = str(helper.get("chat_run_id") or "")
+    run = run_by_id.get(run_id)
+    if run is None and helper.get("_platform_activation_id") and not unsettled_root_exists:
+      # Early lifecycle events used the wait-resume execution id before
+      # ChatRun began preserving that physical identity. When every durable
+      # root is terminal, the first later root boundary proves that this
+      # start-only in-turn activation cannot still be alive. Do not guess
+      # while any root remains active, and do not invent an end before the
+      # helper's last observed activity.
+      activity = max(
+        (
+          value for value in (
+            _iso_to_epoch(helper.get("last_activity_at")),
+            _iso_to_epoch(helper.get("started_at")),
+          ) if value is not None
+        ),
+        default=None,
+      )
+      run = next(
+        (
+          candidate for ended_epoch, candidate in terminal_boundaries
+          if activity is None or ended_epoch >= activity
+        ),
+        None,
+      )
+    if run is None or str(run.get("status") or "").lower() not in terminal_run_states:
+      continue
+    helper["lifecycle_state"] = helper["state"] = "stopped"
+    helper["ended_at"] = run.get("ended_at") or helper.get("last_activity_at")
+    helper["ended_time_quality"] = (
+      "exact" if run.get("ended_at") else "observed"
+    )
+    helper["_root_run_settlement"] = str(
+      run.get("physical_run_id") or run.get("id") or run_id
+    )
+
   # Outcome-only historical records have no assignment to distinguish them
   # from their siblings. They add repeated "No brief was recorded" lanes but
   # cannot answer the owner's primary question: what was this helper doing?
@@ -3443,6 +3511,10 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
     if str(event.get("agent_id") or "") in display_ids
   ]
   platform_subjects = {event["agent_id"] for event in visible_platform_events}
+  platform_terminal_subjects = {
+    event["agent_id"] for event in visible_platform_events
+    if event.get("type") == "agent_terminal"
+  }
   for event in visible_platform_events:
     actor = event.get("parent_agent_id")
     public_events.append(_timeline_event(
@@ -3455,6 +3527,14 @@ def _build_timeline(chat_id: str, provider: str, merged: dict[str, dict],
   for helper in display_helpers:
     aid = str(helper["agent_id"])
     if aid in platform_subjects:
+      settlement = helper.get("_root_run_settlement")
+      if settlement and aid not in platform_terminal_subjects:
+        public_events.append(_timeline_event(
+          f"root-run:{settlement}:{aid}", "agent_terminal", aid, aid,
+          helper.get("lifecycle_state") or "stopped", helper.get("ended_at"),
+          helper.get("last_activity_at"),
+          helper.get("ended_time_quality") or "observed",
+          chat_run_id=helper.get("chat_run_id")))
       continue
     parent = parent_map.get(aid)
     start = helper.get("started_at")
@@ -4526,6 +4606,14 @@ def selftest() -> int:
        "summary": "Review overlapping work", "occurred_at": None,
        "observed_at": "2026-07-17T10:00:02Z", "time_quality": "observed",
        "source": "runner", "source_event_id": "native-b-start"},
+      {"id": 14, "event_key": "c-start", "chat_id": "chatA",
+       "chat_run_id": "wait-resume-legacy", "provider": "claude",
+       "provider_session_id": claude_sid, "agent_id": "opaque-c",
+       "provider_agent_id": "provider-c", "parent_agent_id": None,
+       "type": "agent_started", "state": "running", "agent_type": "research",
+       "summary": "Inspect a legacy resumed turn", "occurred_at": None,
+       "observed_at": "2026-07-17T10:00:03Z", "time_quality": "observed",
+       "source": "runner", "source_event_id": "native-c-start"},
     ]
     platform_events = [_normalized_lifecycle_event(row) for row in platform_rows]
     _assert(all(platform_events), "platform fixture normalizes")
@@ -4545,6 +4633,8 @@ def selftest() -> int:
                     if agent["agent_id"] == "opaque-a")
     opaque_b = next(agent for agent in platform_doc["timeline"]["agents"]
                     if agent["agent_id"] == "opaque-b")
+    opaque_c = next(agent for agent in platform_doc["timeline"]["agents"]
+                    if agent["agent_id"] == "opaque-c")
     _assert(opaque_a["state"] == "done", "platform terminal wins over failed trace")
     _assert(opaque_a["started_at"] is None and opaque_a["timing_conflict"] is True,
             f"contradictory aggregate bounds are suppressed: {opaque_a}")
@@ -4553,14 +4643,43 @@ def selftest() -> int:
             "native turn retains its platform-renamed helper")
     _assert(platform_helpers["opaque-a"]["brief_full"] == "Investigate the flaky test",
             "platform overlay retains the trace prompt document")
-    _assert(opaque_b["parent_agent_id"] is None and opaque_b["ended_at"] is None
+    _assert(opaque_b["parent_agent_id"] is None
+            and opaque_b["state"] == "stopped"
+            and opaque_b["ended_at"] == "2026-07-17T10:00:06Z"
             and opaque_b["start_time_quality"] == "observed"
             and opaque_b["started_at"] == "2026-07-17T10:00:02Z",
-            f"observed-only open helper stays honest: {opaque_b}")
+            f"terminal root settles a start-only helper: {opaque_b}")
+    _assert(opaque_c["state"] == "stopped"
+            and opaque_c["ended_at"] == "2026-07-17T10:00:06Z",
+            f"later terminal root settles a legacy unmatched helper: {opaque_c}")
     a_events = [event for event in platform_doc["timeline"]["events"]
                 if event["subject_agent_id"] == "opaque-a"]
     _assert([event["type"] for event in a_events] == ["agent_started", "agent_terminal"],
             f"terminal-before-start input is causally ordered: {a_events}")
+    b_events = [event for event in platform_doc["timeline"]["events"]
+                if event["subject_agent_id"] == "opaque-b"]
+    _assert([event["type"] for event in b_events] == ["agent_started", "agent_terminal"]
+            and b_events[-1]["state"] == "stopped",
+            f"root settlement adds one honest helper terminal: {b_events}")
+    _, active_root_chats, _, _ = build_documents(
+      json.loads(json.dumps(model_platform)), attribution, now,
+      chat_turns={"chatA": [{
+        "_agent_ids": ["taskA"], "_tools": [], "_original": "Still running.",
+        "_first_request": fixture_request, "ts": "2026-07-17T10:00:00Z",
+      }]}, lifecycle_events=platform_events,
+      lifecycle_runs=[
+        {"id": "run-A", "chat_id": "chatA", "provider": "claude",
+         "status": "completed", "started_at": "2026-07-17T10:00:00Z",
+         "ended_at": "2026-07-17T10:00:06Z"},
+        {"id": "run-live", "chat_id": "chatA", "provider": "claude",
+         "status": "running", "started_at": "2026-07-17T10:01:00Z",
+         "ended_at": None},
+      ])
+    active_c = next(
+      agent for agent in active_root_chats["chatA"]["timeline"]["agents"]
+      if agent["agent_id"] == "opaque-c")
+    _assert(active_c["state"] == "running",
+            "an unmatched helper stays unresolved while any root is active")
     checkpoints = [event for event in platform_doc["timeline"]["events"]
                    if event["type"] == "main_checkpoint"]
     _assert(checkpoints and all(event["subject_agent_id"] == "main"
