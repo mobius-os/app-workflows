@@ -1464,7 +1464,7 @@ def fetch_agent_lifecycle(base_url: str, token: str, after_id: int = 0,
   events: list[dict] = []
   runs_by_id: dict[str, dict] = {}
   for page_index in range(max_pages):
-    path = (f"/api/chats/agent-lifecycle?after_id={cursor}"
+    path = (f"/api/chats/lifecycle-events?after_id={cursor}"
             f"&runs_after_id={run_cursor}"
             f"&limit={LIFECYCLE_PAGE_LIMIT}&run_limit={LIFECYCLE_PAGE_LIMIT}")
     if chat_id is not None:
