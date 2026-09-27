@@ -128,7 +128,7 @@ export const CSS = `
 .wf-btn:active { transform: scale(0.97); }
 .wf-btn:disabled { opacity: 0.5; cursor: default; }
 .wf-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-.wf-btn-secondary { background: var(--surface2, var(--surface)); }
+.wf-btn-secondary { background: var(--surface-2, var(--surface)); }
 .wf-btn-secondary:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 .wf-btn-icon { width: 44px; padding: 0; border-radius: 8px; }
 .wf-btn-icon svg { width: 18px; height: 18px; }
