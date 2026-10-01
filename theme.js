@@ -169,7 +169,7 @@ export const CSS = `
 }
 .wf-needs-go { margin-left: auto; color: var(--muted); font-size: 14px; flex: 0 0 auto; }
 .wf-needs-list {
-  max-height: min(52dvh, 430px); overflow-y: auto; overscroll-behavior: contain;
+  max-height: min(52dvh, 430px); overflow-y: auto; overscroll-behavior: contain auto;
   border-top: 1px solid var(--border); background: var(--surface);
 }
 .wf-needs-group + .wf-needs-group { border-top: 1px solid var(--border); }
