@@ -137,87 +137,6 @@ export const CSS = `
 
 /* ===== Journal (Home) ====================================================== */
 
-/* Compact owner triage. It is neutral by default; semantic color belongs to
-   the state chips and actions rather than tinting an entire mobile viewport. */
-.wf-needs-wrap {
-  width: calc(100% - 28px); margin: 16px 14px 4px; overflow: hidden;
-  border: 1px solid var(--wf-line2); border-radius: 14px; background: var(--surface);
-}
-.wf-needs {
-  display: flex; align-items: center; gap: 11px; width: 100%;
-  margin: 0; padding: 11px 13px 12px;
-  text-align: left; appearance: none; font: inherit; cursor: pointer;
-  color: var(--text); background: transparent; border: 0;
-  transition: background .14s ease;
-}
-.wf-needs:hover { background: var(--wf-s2); }
-.wf-needs:active { background: var(--wf-s3); }
-.wf-needs-ic {
-  flex: 0 0 auto; width: 30px; height: 30px; border-radius: 10px;
-  display: grid; place-items: center; font-size: 14px; font-weight: 800;
-  background: var(--wf-attn-soft); color: var(--text);
-}
-.wf-needs-tx { display: flex; flex-direction: column; min-width: 0; gap: 4px; }
-.wf-needs-head { font-size: 13px; font-weight: 750; color: var(--text); }
-.wf-needs-summary { display: flex; flex-wrap: wrap; gap: 4px; }
-.wf-needs-summary-chip {
-  color: var(--muted); font-size: 10px; font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
-.wf-needs-summary-chip + .wf-needs-summary-chip::before {
-  content: "·"; margin-right: 4px; color: var(--muted);
-}
-.wf-needs-go { margin-left: auto; color: var(--muted); font-size: 14px; flex: 0 0 auto; }
-.wf-needs-list {
-  max-height: min(52dvh, 430px); overflow-y: auto; overscroll-behavior: contain;
-  border-top: 1px solid var(--border); background: var(--surface);
-}
-.wf-needs-group + .wf-needs-group { border-top: 1px solid var(--border); }
-.wf-needs-group-head {
-  min-height: 38px; display: flex; align-items: center; gap: 8px;
-  padding: 8px 12px 5px;
-}
-.wf-needs-group-summary {
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--muted); font-size: 10.5px; line-height: 1.3;
-}
-.wf-needs-item {
-  width: 100%; min-height: 50px; display: grid;
-  grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px;
-  padding: 0 12px 0 19px; background: transparent; color: var(--text);
-}
-.wf-needs-item:hover { background: var(--wf-s2); }
-.wf-needs-item-main {
-  min-width: 0; min-height: 50px; margin: 0; padding: 8px;
-  appearance: none; border: 0; background: transparent; color: var(--text);
-  text-align: left; font: inherit; cursor: pointer;
-}
-.wf-needs-item-main:not(button) { cursor: default; }
-.wf-needs-kind {
-  flex: 0 0 auto; padding: 2px 7px; border-radius: 999px;
-  background: var(--wf-attn-soft); color: var(--text); font-size: 9.5px; font-weight: 750;
-}
-.wf-needs-kind.is-failed {
-  background: color-mix(in srgb, var(--danger, #c0392b) 15%, transparent);
-}
-.wf-needs-kind.is-paused { background: var(--wf-s3); }
-.wf-needs-item-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.wf-needs-item-title {
-  min-width: 0; font-size: 12.5px; font-weight: 650; line-height: 1.3;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.wf-needs-item-reason {
-  min-width: 0; color: var(--muted); font-size: 10.5px; line-height: 1.3;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.wf-needs-action {
-  min-height: 30px; display: inline-flex; align-items: center; padding: 5px 9px;
-  appearance: none; border: 0; border-radius: 9px;
-  background: var(--wf-s2); color: var(--wf-link);
-  font: inherit; font-size: 10.5px; font-weight: 750; white-space: nowrap; cursor: pointer;
-}
-.wf-needs-action.is-failed { color: color-mix(in srgb, var(--danger, #c0392b) 64%, var(--text)); }
-
 .wf-day-group { margin-top: 6px; }
 .wf-daylabel {
   margin: 0; font-size: 13px; font-weight: 750; color: var(--text);
@@ -325,7 +244,7 @@ export const CSS = `
   max-width: 68ch; margin: 3px 0 0; font-size: 18px; font-weight: 700;
   letter-spacing: -0.02em; line-height: 1.28; text-wrap: balance; color: var(--text);
 }
-.wf-chat-meta, .wf-turn-meta {
+.wf-chat-meta {
   margin-top: 8px; font-size: 11.5px; color: var(--muted);
   display: flex; gap: 7px; align-items: center; flex-wrap: wrap;
 }
@@ -349,36 +268,6 @@ export const CSS = `
    not proportional to elapsed time. */
 .wf-time-section { position: relative; min-width: 0; }
 .wf-time-section:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-.wf-flow-attention {
-  width: min(560px, calc(100% - 58px)); margin: 0 0 14px 58px; padding: 10px;
-  display: grid; grid-template-columns: 30px minmax(0, 1fr) auto;
-  align-items: center; gap: 10px; border: 1px solid var(--wf-line2);
-  border-radius: 12px; background: var(--surface);
-}
-.wf-flow-attention-icon {
-  width: 30px; height: 30px; display: grid; place-items: center;
-  border-radius: 10px; background: var(--wf-attn-soft); color: var(--text);
-  font-size: 14px; font-weight: 850;
-}
-.wf-flow-attention-copy { min-width: 0; }
-.wf-flow-attention-head { display: flex; align-items: center; gap: 7px; }
-.wf-flow-attention-head h2 { margin: 0; font-size: 13px; line-height: 1.3; }
-.wf-flow-attention-kind {
-  padding: 2px 7px; border-radius: 999px; color: var(--text);
-  background: color-mix(in srgb, var(--wf-attn) 18%, transparent);
-  font-size: 9.5px; font-weight: 750;
-}
-.wf-flow-attention-kind.is-failed {
-  background: color-mix(in srgb, var(--danger, #c0392b) 16%, transparent);
-}
-.wf-flow-attention-kind.is-paused { background: var(--wf-s3); }
-.wf-flow-attention-reason {
-  margin: 4px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.4;
-  text-wrap: pretty;
-}
-.wf-flow-attention-actions { display: flex; align-items: center; gap: 6px; }
-.wf-flow-attention-actions .wf-btn { min-height: 36px; padding: 7px 10px; font-size: 11.5px; }
-.wf-attention-review { background: transparent; }
 .wf-time-overview {
   width: min(560px, calc(100% - 58px)); margin: 0 0 10px 58px; padding: 3px 8px 13px;
 }
@@ -650,9 +539,7 @@ export const CSS = `
 @media (max-width: 600px) {
   .wf-flow { padding: 12px 12px 38px; }
   .wf-root-body { padding: 10px 11px 7px; }
-  .wf-time-overview, .wf-flow-attention { width: calc(100% - 58px); }
-  .wf-flow-attention { grid-template-columns: 30px minmax(0, 1fr); align-items: start; }
-  .wf-flow-attention-actions { grid-column: 2; flex-wrap: wrap; }
+  .wf-time-overview { width: calc(100% - 58px); }
   .wf-agent-inspector {
     top: calc(52px + env(safe-area-inset-top)); left: 0; width: 100%; border-left: 0; box-shadow: 0 -2px 8px rgba(0, 0, 0, .16);
   }
