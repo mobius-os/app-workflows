@@ -244,7 +244,7 @@ export const CSS = `
   max-width: 68ch; margin: 3px 0 0; font-size: 18px; font-weight: 700;
   letter-spacing: -0.02em; line-height: 1.28; text-wrap: balance; color: var(--text);
 }
-.wf-chat-meta, .wf-turn-meta {
+.wf-chat-meta {
   margin-top: 8px; font-size: 11.5px; color: var(--muted);
   display: flex; gap: 7px; align-items: center; flex-wrap: wrap;
 }
@@ -268,36 +268,6 @@ export const CSS = `
    not proportional to elapsed time. */
 .wf-time-section { position: relative; min-width: 0; }
 .wf-time-section:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-.wf-flow-attention {
-  width: min(560px, calc(100% - 58px)); margin: 0 0 14px 58px; padding: 10px;
-  display: grid; grid-template-columns: 30px minmax(0, 1fr) auto;
-  align-items: center; gap: 10px; border: 1px solid var(--wf-line2);
-  border-radius: 12px; background: var(--surface);
-}
-.wf-flow-attention-icon {
-  width: 30px; height: 30px; display: grid; place-items: center;
-  border-radius: 10px; background: var(--wf-attn-soft); color: var(--text);
-  font-size: 14px; font-weight: 850;
-}
-.wf-flow-attention-copy { min-width: 0; }
-.wf-flow-attention-head { display: flex; align-items: center; gap: 7px; }
-.wf-flow-attention-head h2 { margin: 0; font-size: 13px; line-height: 1.3; }
-.wf-flow-attention-kind {
-  padding: 2px 7px; border-radius: 999px; color: var(--text);
-  background: color-mix(in srgb, var(--wf-attn) 18%, transparent);
-  font-size: 9.5px; font-weight: 750;
-}
-.wf-flow-attention-kind.is-failed {
-  background: color-mix(in srgb, var(--danger, #c0392b) 16%, transparent);
-}
-.wf-flow-attention-kind.is-paused { background: var(--wf-s3); }
-.wf-flow-attention-reason {
-  margin: 4px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.4;
-  text-wrap: pretty;
-}
-.wf-flow-attention-actions { display: flex; align-items: center; gap: 6px; }
-.wf-flow-attention-actions .wf-btn { min-height: 36px; padding: 7px 10px; font-size: 11.5px; }
-.wf-attention-review { background: transparent; }
 .wf-time-overview {
   width: min(560px, calc(100% - 58px)); margin: 0 0 10px 58px; padding: 3px 8px 13px;
 }
@@ -569,9 +539,7 @@ export const CSS = `
 @media (max-width: 600px) {
   .wf-flow { padding: 12px 12px 38px; }
   .wf-root-body { padding: 10px 11px 7px; }
-  .wf-time-overview, .wf-flow-attention { width: calc(100% - 58px); }
-  .wf-flow-attention { grid-template-columns: 30px minmax(0, 1fr); align-items: start; }
-  .wf-flow-attention-actions { grid-column: 2; flex-wrap: wrap; }
+  .wf-time-overview { width: calc(100% - 58px); }
   .wf-agent-inspector {
     top: calc(52px + env(safe-area-inset-top)); left: 0; width: 100%; border-left: 0; box-shadow: 0 -2px 8px rgba(0, 0, 0, .16);
   }
