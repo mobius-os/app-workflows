@@ -243,7 +243,29 @@ class CursorStore:
     return self.files.get(key, {})
 
   def set(self, key: str, cur: dict) -> None:
-    self.files[key] = cur
+    if cur:
+      self.files[key] = cur
+    else:
+      # An absent file (e.g. a run without a journal) yields an empty cursor;
+      # `get` already defaults to {}, so storing it would only grow the state.
+      self.files.pop(key, None)
+
+  def forget_deleted(self, live_roots: list[Path]) -> int:
+    """Drops cursors for files that were deleted under a trace root that still
+    exists, so the state stays bounded as old transcripts are cleaned up.
+
+    Only roots that exist right now count. A missing root (provider not set
+    up, volume not mounted yet) keeps every cursor: dropping them would make a
+    returning file read from byte 0 without the `rescanned` reset, folding its
+    records into the model twice. Returns how many entries were dropped."""
+    roots = [str(r) + os.sep for r in live_roots if r.is_dir()]
+    dropped = 0
+    for key in list(self.files):
+      file_path = key.split("::", 1)[1] if key.startswith("codex-sid::") else key
+      if any(file_path.startswith(r) for r in roots) and not os.path.exists(file_path):
+        del self.files[key]
+        dropped += 1
+    return dropped
 
   def save(self) -> None:
     save_json(self.path, {"schema": SCHEMA_VERSION, "files": self.files})
@@ -537,6 +559,12 @@ def _agent(model: dict, sid: str, run_id: str, agent_id: str, kind: str) -> dict
 
 
 # --- Claude tree parsing ----------------------------------------------------
+
+def trace_roots(cc_dir: Path, codex_home: Path) -> list[Path]:
+  """The directories `parse_claude` and `parse_codex` walk; every cursor key
+  names a file below one of them."""
+  return [cc_dir / "projects" / "-data", codex_home / "sessions"]
+
 
 def parse_claude(cc_dir: Path, model: dict, cursors: CursorStore, budget: Budget) -> None:
   """Walks `<cc>/projects/-data` and folds every session's helper traces into
@@ -4079,6 +4107,7 @@ def run_refresh(cc_dir: Path, codex_home: Path, state_dir: Path,
 
   parse_claude(cc_dir, model, cursors, budget)
   parse_codex(codex_home, model, cursors, budget)
+  cursors.forget_deleted(trace_roots(cc_dir, codex_home))
   _enforce_parent_invariant(model)
   _mark_expired_sources(model, cc_dir, codex_home)
 
@@ -5516,6 +5545,20 @@ def selftest() -> int:
     _parse_task_board(bdir, sid8, m8)
     _assert(m8["agents"][f"{sid8}::a8"]["board_status"] is None,
             "board failure cleared once no card is failing")
+
+    # Cursors for deleted transcripts are dropped; a missing root keeps its own.
+    gc = root / "gc"; live = gc / "projects" / "-data"; gone_root = gc / "codex" / "sessions"
+    kept = live / "s" / "kept.jsonl"; _write(kept, "{}\n")
+    cur9 = CursorStore(root / "gc-cur.json")
+    cur9.set(str(kept), {"ino": 1, "offset": 3})
+    cur9.set(str(live / "s" / "deleted.jsonl"), {"ino": 2, "offset": 9})
+    cur9.set(f"codex-sid::{live / 's' / 'deleted.jsonl'}", {"sid": "x"})
+    cur9.set(str(gone_root / "r.jsonl"), {"ino": 3, "offset": 1})
+    cur9.set(str(live / "s" / "no-journal.jsonl"), {})
+    dropped = cur9.forget_deleted([live, gone_root])
+    _assert(dropped == 2, f"deleted transcript cursors dropped: got {dropped}")
+    _assert(sorted(cur9.files) == sorted([str(kept), str(gone_root / "r.jsonl")]),
+            f"live files and unmounted roots keep cursors: {sorted(cur9.files)}")
 
     print("SELFTEST OK")
     print(f"  chats={len(index['entries'])} unlinked={len(unlinked)} "
